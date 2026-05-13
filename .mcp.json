@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "stable-diffusion-cpp": {
+      "command": "pwsh.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "./resources/mcp-server.ps1"
+      ]
+    }
+  }
+}

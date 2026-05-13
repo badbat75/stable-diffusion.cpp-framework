@@ -67,6 +67,8 @@ Copy-Item "$PSScriptRoot\resources\run-server.ps1"          -Destination $stageD
 Copy-Item "$PSScriptRoot\resources\config-model.ps1"        -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\config-server.ps1"       -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\common-functions.ps1"    -Destination $stageDir -Force
+Copy-Item "$PSScriptRoot\resources\mcp-server.ps1"          -Destination $stageDir -Force
+Copy-Item "$PSScriptRoot\resources\mcp-config.template.json" -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\stable-diffusion.ico"    -Destination $stageDir -Force
 
 # ── Generate .nsi from template ─────────────────────────────────────

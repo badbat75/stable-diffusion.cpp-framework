@@ -146,9 +146,30 @@ ModelsDir = $modelsDirVal
 
 [System.IO.File]::WriteAllText($serverPath, $content, [System.Text.UTF8Encoding]::new($false))
 
+# ── MCP client config ────────────────────────────────────────────────
+# Materialize resources\mcp-config.template.json into
+#   %LOCALAPPDATA%\stable-diffusion.cpp\config\mcp.json
+# so any MCP-aware agent (Claude Code, etc.) can be pointed at it without
+# the user editing JSON by hand. We use forward slashes in the script path
+# so it stays valid JSON without backslash escaping and pwsh accepts it.
+$mcpTemplate = Join-Path $PSScriptRoot "mcp-config.template.json"
+$mcpOut      = Join-Path $configDir "mcp.json"
+if (Test-Path -LiteralPath $mcpTemplate) {
+    $scriptDir = $PSScriptRoot -replace '\\', '/'
+    $mcpJson   = (Get-Content -LiteralPath $mcpTemplate -Raw) -replace '@SCRIPT_DIR@', $scriptDir
+    [System.IO.File]::WriteAllText($mcpOut, $mcpJson, [System.Text.UTF8Encoding]::new($false))
+}
+
 if (-not $NonInteractive) {
     Write-Host ""
     Write-Host "Configuration written to:" -ForegroundColor Green
     Write-Host "  $serverPath"
+    if (Test-Path -LiteralPath $mcpOut) {
+        Write-Host "  $mcpOut" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "To load the MCP server into Claude Code:" -ForegroundColor Cyan
+        Write-Host "  claude --mcp-config `"$mcpOut`""
+        Write-Host "or merge the file's `"mcpServers`" entry into ~/.claude.json." -ForegroundColor DarkGray
+    }
     Write-Host ""
 }

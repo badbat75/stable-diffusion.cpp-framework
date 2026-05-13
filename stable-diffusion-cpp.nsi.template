@@ -150,6 +150,8 @@ Section "stable-diffusion.cpp binaries (required)" SecMain
     File "@STAGING_DIR@\config-model.ps1"
     File "@STAGING_DIR@\config-server.ps1"
     File "@STAGING_DIR@\common-functions.ps1"
+    File "@STAGING_DIR@\mcp-server.ps1"
+    File "@STAGING_DIR@\mcp-config.template.json"
     File "@STAGING_DIR@\stable-diffusion.ico"
 
     ; Write user-scope server.ini from the install-time page values.
@@ -302,6 +304,8 @@ Section "Uninstall"
     Delete "$INSTDIR\config-model.ps1"
     Delete "$INSTDIR\config-server.ps1"
     Delete "$INSTDIR\common-functions.ps1"
+    Delete "$INSTDIR\mcp-server.ps1"
+    Delete "$INSTDIR\mcp-config.template.json"
     Delete "$INSTDIR\stable-diffusion.ico"
     Delete "$INSTDIR\uninstall.exe"
     RMDir "$INSTDIR"
