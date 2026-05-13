@@ -24,7 +24,6 @@ Var Threads              ; default = floor(cores * 0.5)
 Var Hwnd
 Var ModelsFolderBox
 Var ModelsFolderBrowseBtn
-Var ServerPortBox
 Var ServerEnabledCheck
 
 ; Write to the native 64-bit registry view (not Wow6432Node).
