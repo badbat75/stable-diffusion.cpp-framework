@@ -101,9 +101,7 @@ Function CheckPreviousInstall
     Abort
 
     uninstall:
-        ; Strip surrounding quotes from UninstallString.
-        GetTempFileName $2 ""  "uninstall.exe"
-        ExecWait '"$0" /S _?=$INSTDIR'
+        ExecWait '"$INSTDIR\uninstall.exe" /S _?=$INSTDIR'
         Delete "$INSTDIR\uninstall.exe"
         RMDir "$INSTDIR"
     done:
@@ -130,18 +128,12 @@ Section "stable-diffusion.cpp (required)" SecMain
 
     ; Registry — Add/Remove Programs.
     WriteRegStr HKLM "Software\stable-diffusion.cpp" "InstallDir" "$INSTDIR"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
-        "DisplayName"       "stable-diffusion.cpp @VERSION@"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
-        "UninstallString"   "\"$INSTDIR\uninstall.exe\""
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
-        "DisplayVersion"  "@VERSION@"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
-        "Publisher"     "stable-diffusion.cpp"
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
-        "NoModify"  1
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
-        "NoRepair"  1
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "DisplayName" "stable-diffusion.cpp @VERSION@"
+     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "UninstallString" $\"$INSTDIR\uninstall.exe$\"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "DisplayVersion" "@VERSION@"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "Publisher" "stable-diffusion.cpp"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "NoRepair" 1
 SectionEnd
 
 ; ── Optional: Add to system PATH ───────────────────────────────────
