@@ -18,20 +18,17 @@ SetCompressor zlib
 ; ── Variables for the install-time config page ──────────────────────
 Var ModelsFolder
 Var ServerPort
-Var ServerEnabled        ; "true" or "false" — enable/disable sd-server
 Var Threads              ; default = floor(cores * 0.5)
 
 Var Hwnd
 Var ModelsFolderBox
 Var ModelsFolderBrowseBtn
-Var ServerEnabledCheck
 
 ; Write to the native 64-bit registry view (not Wow6432Node).
 Function .onInit
     SetRegView 64
     StrCpy $ModelsFolder   "$PROFILE\.stable-diffusion.cpp\models"
     StrCpy $ServerPort     "7860"
-    StrCpy $ServerEnabled  "true"
 
     ; Thread defaults: floor(cores / 2), min 1.
     ReadEnvStr $0 "NUMBER_OF_PROCESSORS"
@@ -55,14 +52,10 @@ Function .onInit
         ${If} $0 != ""
             StrCpy $ModelsFolder $0
         ${EndIf}
-        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "ServerPort"
-        ${If} $0 != ""
-            StrCpy $ServerPort $0
-        ${EndIf}
-        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "ServerEnabled"
-        ${If} $0 != ""
-            StrCpy $ServerEnabled $0
-        ${EndIf}
+   ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "ServerPort"
+    ${If} $0 != ""
+        StrCpy $ServerPort $0
+    ${EndIf}
         ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "Threads"
         ${If} $0 != ""
             StrCpy $Threads $0
@@ -121,7 +114,7 @@ Section "stable-diffusion.cpp (required)" SecMain
 
     ; Write config.ini from install-time page values.
     DetailPrint "Writing generation config..."
-    nsExec::ExecToLog 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\config-generate.ps1" -NonInteractive -ModelsFolder "$ModelsFolder" -ServerPort $ServerPort -ServerEnabled $ServerEnabled -Threads $Threads'
+  nsExec::ExecToLog 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\config-generate.ps1" -NonInteractive -ModelsFolder "$ModelsFolder" -ServerPort $ServerPort -Threads $Threads'
 
     WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -181,17 +174,8 @@ Function InstallConfigPage
     ${NSD_OnClick} $ModelsFolderBrowseBtn OnBrowseModels
 
     ; Row 2 — Thread count (read-only display of auto-detected value).
-    ${NSD_CreateLabel}  0 48u   100%     12u   "Default threads: $Threads  (auto-detected from $0 CPUs)"
+  ${NSD_CreateLabel}  0 48u   100%     12u   "Default threads: $Threads  (auto-detected from $0 CPUs)"
     Pop $Hwnd
-
-    ; Row 3 — SD Server enable checkbox.
-    ${NSD_CreateLabel}  0 68u   100%     12u   "SD Server (HTTP API for image generation requests):"
-    Pop $Hwnd
-    ${NSD_CreateCheckBox} 0 82u 60%      14u   "Enable sd-server on startup"
-    Pop $ServerEnabledCheck
-    ${If} $ServerEnabled == "true"
-        ${NSD_SetState} $ServerEnabledCheck ${BST_CHECKED}
-    ${EndIf}
 
     nsDialogs::Show
 FunctionEnd
@@ -206,13 +190,7 @@ Function OnBrowseModels
 FunctionEnd
 
 Function InstallConfigLeave
-    ${NSD_GetText}   $ModelsFolderBox $ModelsFolder
-    ${NSD_GetState}  $ServerEnabledCheck $0
-    ${If} $0 = ${BST_CHECKED}
-        StrCpy $ServerEnabled "true"
-    ${Else}
-        StrCpy $ServerEnabled "false"
-    ${EndIf}
+  ${NSD_GetText}   $ModelsFolderBox $ModelsFolder
 FunctionEnd
 
 ; ── Section descriptions ────────────────────────────────────────────
