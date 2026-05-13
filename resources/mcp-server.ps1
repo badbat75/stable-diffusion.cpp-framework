@@ -94,6 +94,22 @@ function Send-RpcNotification {
 }
 
 # ── Tool: generate_image ─────────────────────────────────────────────
+# Accepts a file path OR an already-encoded image string (raw base64 or
+# a data:image/...;base64,... URL). sd-server strips the data: prefix
+# itself, so we pass data URLs through unmodified.
+function Resolve-ImageArgument {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    if ($Value.StartsWith('data:')) { return $Value }
+    if (Test-Path -LiteralPath $Value -PathType Leaf) {
+        $full  = (Resolve-Path -LiteralPath $Value).Path
+        $bytes = [System.IO.File]::ReadAllBytes($full)
+        Write-Log INFO ("loaded reference image from disk: {0} ({1} bytes)" -f $full, $bytes.Length)
+        return [Convert]::ToBase64String($bytes)
+    }
+    return $Value
+}
+
 function Invoke-GenerateImage {
     param([hashtable]$Arguments, $ProgressToken = $null)
 
@@ -104,7 +120,8 @@ function Invoke-GenerateImage {
     }
 
     # Translate flat MCP args → sd-server's nested gen_params schema.
-    # Top-level: prompt, negative_prompt, width, height, batch_count, seed.
+    # Top-level: prompt, negative_prompt, width, height, batch_count, seed,
+    #   init_image, ref_images, strength, auto_resize_ref_image.
     # Nested under sample_params: sample_steps, sample_method, scheduler,
     #   plus guidance.txt_cfg / guidance.distilled_guidance.
     $sampleParams = @{}
@@ -129,9 +146,32 @@ function Invoke-GenerateImage {
     if ($Arguments.ContainsKey('seed'))            { $body.seed            = [int64]$Arguments['seed'] }
     if ($sampleParams.Count -gt 0)                 { $body.sample_params   = $sampleParams }
 
+    # Reference / init image inputs. init_image triggers img2img; ref_images
+    # feeds reference-aware models (Flux Kontext, etc.). Both accept file
+    # paths or base64 strings; strength only matters with init_image.
+    $refCount = 0
+    if ($Arguments.ContainsKey('init_image')) {
+        $enc = Resolve-ImageArgument -Value ([string]$Arguments['init_image'])
+        if ($enc) { $body.init_image = $enc }
+    }
+    if ($Arguments.ContainsKey('ref_images') -and $Arguments['ref_images']) {
+        $refs = @()
+        foreach ($r in @($Arguments['ref_images'])) {
+            $enc = Resolve-ImageArgument -Value ([string]$r)
+            if ($enc) { $refs += $enc }
+        }
+        if ($refs.Count -gt 0) {
+            $body.ref_images = $refs
+            $refCount        = $refs.Count
+        }
+    }
+    if ($Arguments.ContainsKey('strength'))              { $body.strength              = [double]$Arguments['strength'] }
+    if ($Arguments.ContainsKey('auto_resize_ref_image')) { $body.auto_resize_ref_image = [bool]$Arguments['auto_resize_ref_image'] }
+
     $promptPreview = $body.prompt.Substring(0, [Math]::Min(60, $body.prompt.Length))
-    Write-Log INFO ("submit img_gen: '{0}...' {1}x{2} batch={3} fmt={4}" -f
-        $promptPreview, $body.width, $body.height, $body.batch_count, $body.output_format)
+    $hasInit       = if ($body.ContainsKey('init_image')) { 'yes' } else { 'no' }
+    Write-Log INFO ("submit img_gen: '{0}...' {1}x{2} batch={3} fmt={4} init_image={5} ref_images={6}" -f
+        $promptPreview, $body.width, $body.height, $body.batch_count, $body.output_format, $hasInit, $refCount)
 
     $submit = Invoke-SdJson -Method POST -Path '/sdcpp/v1/img_gen' -Body $body
     $jobId  = $submit.id
@@ -213,27 +253,135 @@ function Invoke-GenerateImage {
         default { 'application/octet-stream' }
     }
 
+    # save_path: optional disk dump. When set, default is to NOT also stream
+    # the image inline (return_inline opts back in). When unset, default
+    # remains "inline only" so existing callers are unaffected.
+    $savePath = if ($Arguments.ContainsKey('save_path')) { [string]$Arguments['save_path'] } else { '' }
+    $returnInline = if ($Arguments.ContainsKey('return_inline')) {
+        [bool]$Arguments['return_inline']
+    } else {
+        [string]::IsNullOrWhiteSpace($savePath)
+    }
+
+    $savedPaths = @()
+    if (-not [string]::IsNullOrWhiteSpace($savePath)) {
+        # Resolve relative paths against the MCP server's CWD (set by
+        # run-server.ps1 to %LOCALAPPDATA%\stable-diffusion.cpp when launched
+        # via the installer; arbitrary otherwise). Caller should pass absolute
+        # to avoid surprises.
+        $resolved = [System.IO.Path]::GetFullPath($savePath)
+        $parent   = [System.IO.Path]::GetDirectoryName($resolved)
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        if ($images.Count -eq 1) {
+            $bytes = [Convert]::FromBase64String([string]$images[0].b64_json)
+            [System.IO.File]::WriteAllBytes($resolved, $bytes)
+            $savedPaths += $resolved
+            Write-Log INFO ("saved image to {0} ({1} bytes)" -f $resolved, $bytes.Length)
+        } else {
+            $dir  = [System.IO.Path]::GetDirectoryName($resolved)
+            $stem = [System.IO.Path]::GetFileNameWithoutExtension($resolved)
+            $ext  = [System.IO.Path]::GetExtension($resolved)
+            for ($i = 0; $i -lt $images.Count; $i++) {
+                $suffix = '{0:D3}' -f ($i + 1)
+                $name   = "{0}_{1}{2}" -f $stem, $suffix, $ext
+                $p      = if ($dir) { Join-Path $dir $name } else { $name }
+                $bytes  = [Convert]::FromBase64String([string]$images[$i].b64_json)
+                [System.IO.File]::WriteAllBytes($p, $bytes)
+                $savedPaths += $p
+                Write-Log INFO ("saved image {0}/{1} to {2} ({3} bytes)" -f ($i+1), $images.Count, $p, $bytes.Length)
+            }
+        }
+    }
+
     # annotations hint to MCP clients that the image is meant for the user
     # to see (audience=user, high priority) — by-the-book per MCP spec. Note:
     # claude.ai web is reported to ignore the hint and not render inline
     # regardless (modelcontextprotocol/specification issue #238); Claude Code
     # honours it. Doesn't hurt to send it.
     $imageContents = @()
-    foreach ($img in $images) {
-        $b64 = [string]$img.b64_json
-        $imageContents += @{
-            type        = 'image'
-            data        = $b64
-            mimeType    = $mime
-            annotations = @{ audience = @('user'); priority = 0.9 }
+    if ($returnInline) {
+        foreach ($img in $images) {
+            $b64 = [string]$img.b64_json
+            $imageContents += @{
+                type        = 'image'
+                data        = $b64
+                mimeType    = $mime
+                annotations = @{ audience = @('user'); priority = 0.9 }
+            }
         }
     }
 
     $elapsed = [int]((Get-Date) - $started).TotalSeconds
     $summary = "Generated $($images.Count) image(s) in ${elapsed}s."
-    Write-Log INFO "job $jobId completed in ${elapsed}s — $($images.Count) image(s) returned"
+    if ($savedPaths.Count -gt 0) {
+        $summary += " Saved to: " + ($savedPaths -join '; ') + "."
+    }
+    if (-not $returnInline) {
+        $summary += " (Inline image omitted; pass return_inline=true to also embed.)"
+    }
+    Write-Log INFO ("job {0} completed in {1}s — {2} image(s), inline={3}, saved={4}" -f
+        $jobId, $elapsed, $images.Count, $returnInline, $savedPaths.Count)
 
     return @{ content = @(@{ type = 'text'; text = $summary }) + $imageContents }
+}
+
+# ── Tool: encode_file_base64 ─────────────────────────────────────────
+# Reads a local file and returns its base64 representation as a text
+# block. Intended for staging reference / init images that will be passed
+# into generate_image, but works for any binary file. Capped at 25 MB raw
+# (≈ 34 MB base64) by default to keep model context costs sane; override
+# with max_bytes.
+function Invoke-EncodeFileBase64 {
+    param([hashtable]$Arguments)
+
+    if (-not $Arguments -or
+        -not $Arguments.ContainsKey('path') -or
+        [string]::IsNullOrWhiteSpace([string]$Arguments['path'])) {
+        throw "missing required argument: path"
+    }
+
+    $path = [string]$Arguments['path']
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "file not found: $path"
+    }
+    $full = (Resolve-Path -LiteralPath $path).Path
+    $info = Get-Item -LiteralPath $full
+
+    $maxBytes = if ($Arguments.ContainsKey('max_bytes')) { [int64]$Arguments['max_bytes'] } else { 26214400 }
+    if ($info.Length -gt $maxBytes) {
+        throw ("file too large: {0} bytes (cap {1}). Pass max_bytes to override." -f $info.Length, $maxBytes)
+    }
+
+    $asDataUrl = $false
+    if ($Arguments.ContainsKey('as_data_url')) { $asDataUrl = [bool]$Arguments['as_data_url'] }
+
+    $ext  = $info.Extension.ToLowerInvariant().TrimStart('.')
+    $mime = switch ($ext) {
+        'png'  { 'image/png' }
+        'jpg'  { 'image/jpeg' }
+        'jpeg' { 'image/jpeg' }
+        'webp' { 'image/webp' }
+        'gif'  { 'image/gif' }
+        'bmp'  { 'image/bmp' }
+        default { 'application/octet-stream' }
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($full)
+    $b64   = [Convert]::ToBase64String($bytes)
+    if ($asDataUrl) { $b64 = "data:${mime};base64,$b64" }
+
+    Write-Log INFO ("encode_file_base64: {0} ({1} bytes -> {2} chars, mime={3}, data_url={4})" -f
+        $full, $info.Length, $b64.Length, $mime, $asDataUrl)
+
+    $summary = "Encoded $($info.Length) bytes from $full as base64 (mime=$mime, $($b64.Length) chars)."
+    return @{
+        content = @(
+            @{ type = 'text'; text = $summary },
+            @{ type = 'text'; text = $b64 }
+        )
+    }
 }
 
 # ── Tool registry ────────────────────────────────────────────────────
@@ -258,6 +406,29 @@ $Tools = @(
                 batch_count     = @{ type = 'integer'; default = 1; minimum = 1; maximum = 8 }
                 output_format   = @{ type = 'string';  enum = @('png','jpeg','webp'); default = 'jpeg'; description = 'JPEG keeps Claude context cost low; PNG for pixel-perfect.' }
                 output_compression = @{ type = 'integer'; default = 90; minimum = 1; maximum = 100; description = 'JPEG/WebP quality. Ignored for PNG.' }
+                init_image      = @{ type = 'string';  description = 'Image to denoise from (img2img). STRONGLY PREFER an absolute file path (.png/.jpg/.webp) — the MCP server loads and base64-encodes the file locally. Raw base64 / data: URLs are accepted but will silently truncate for any image bigger than a few KB because the model cannot reproduce them verbatim across a tool call. Do NOT chain `encode_file_base64` into this argument. Use the `strength` arg to control how much is preserved.' }
+                ref_images      = @{
+                    type        = 'array'
+                    items       = @{ type = 'string' }
+                    description = 'Reference images for multi-reference-aware models (Flux Kontext, OmniGen, etc.). STRONGLY PREFER absolute file paths — the MCP server loads each file from disk and encodes it locally. Raw base64 / data: URLs are accepted but break in practice on anything larger than a thumbnail because the model truncates the string when emitting the tool call. Do NOT chain `encode_file_base64` into this argument. Has no effect on plain SDXL/Flux dev models. Pair with prompts that mention what each reference depicts.'
+                }
+                strength             = @{ type = 'number';  minimum = 0; maximum = 1; description = 'Denoise strength for img2img (0 = keep init_image, 1 = ignore it). Only used when init_image is set. sd.cpp default is 0.75.' }
+                auto_resize_ref_image = @{ type = 'boolean'; description = 'If true, ref_images are resized to match output width/height. Defaults to the sd-server preset.' }
+                save_path            = @{ type = 'string';  description = 'Optional absolute path to also write the rendered image to disk. Parent directory is auto-created. If batch_count > 1, the filename stem is suffixed with _001, _002, ... before the extension. Extension is honoured as-is — match it to output_format (jpeg/png/webp) yourself. Relative paths resolve against the MCP server CWD, which is unpredictable — pass absolute paths.' }
+                return_inline        = @{ type = 'boolean'; description = 'Whether to also embed the rendered image(s) as inline base64 MCP content. Default: true when save_path is not set (current behavior), false when save_path is set (avoids blowing up context for batches you only want on disk). Set true with save_path to get both.' }
+            }
+        }
+    },
+    @{
+        name        = 'encode_file_base64'
+        description = 'Read a local binary file and return its base64 representation as a text block. WARNING: do NOT use this to stage images for generate_image — the model cannot reliably emit a multi-KB base64 string verbatim when feeding the result back into another tool call, so generate_image will fail with "invalid ref_images". Pass the raw file path to generate_image instead; the MCP server encodes it internally without round-tripping through the model. This tool is only useful for small files (a few KB) or when the caller genuinely needs the base64 surfaced into the conversation. Capped at 25 MB raw by default.'
+        inputSchema = @{
+            type     = 'object'
+            required = @('path')
+            properties = @{
+                path        = @{ type = 'string';  description = 'Absolute path to the file to encode.' }
+                as_data_url = @{ type = 'boolean'; default = $false; description = 'If true, prefix output with `data:<mime>;base64,` so it can be dropped straight into HTML/CSS or APIs that expect a data URL.' }
+                max_bytes   = @{ type = 'integer'; default = 26214400; minimum = 1; description = 'Raw-file size cap. Files larger than this are rejected to keep model context affordable.' }
             }
         }
     }
@@ -275,8 +446,9 @@ function New-RpcError  {
 function Invoke-Tool {
     param([string]$Name, [hashtable]$Arguments, $ProgressToken = $null)
     switch ($Name) {
-        'generate_image' { return Invoke-GenerateImage -Arguments $Arguments -ProgressToken $ProgressToken }
-        default          { throw "unknown tool: $Name" }
+        'generate_image'     { return Invoke-GenerateImage    -Arguments $Arguments -ProgressToken $ProgressToken }
+        'encode_file_base64' { return Invoke-EncodeFileBase64 -Arguments $Arguments }
+        default              { throw "unknown tool: $Name" }
     }
 }
 
