@@ -1,0 +1,272 @@
+; stable-diffusion.cpp NSIS Installer Template
+; Placeholders replaced by 03-package.ps1:
+;   @VERSION@, @STAGING_DIR@, @OUTPUT_FILE@
+
+!include "MUI2.nsh"
+!include "WinMessages.nsh"
+!include "LogicLib.nsh"
+!include "nsDialogs.nsh"
+
+; ── Installer metadata ──────────────────────────────────────────────
+Name "stable-diffusion.cpp @VERSION@"
+OutFile "@OUTPUT_FILE@"
+InstallDir "$PROGRAMFILES64\stable-diffusion.cpp"
+InstallDirRegKey HKLM "Software\stable-diffusion.cpp" "InstallDir"
+RequestExecutionLevel admin
+SetCompressor zlib
+
+; ── Variables for the install-time config page ──────────────────────
+Var ModelsFolder
+Var ServerPort
+Var ServerEnabled        ; "true" or "false" — enable/disable sd-server
+Var Threads              ; default = floor(cores * 0.5)
+
+Var Hwnd
+Var ModelsFolderBox
+Var ModelsFolderBrowseBtn
+Var ServerPortBox
+Var ServerEnabledCheck
+
+; Write to the native 64-bit registry view (not Wow6432Node).
+Function .onInit
+    SetRegView 64
+    StrCpy $ModelsFolder   "$PROFILE\.stable-diffusion.cpp\models"
+    StrCpy $ServerPort     "7860"
+    StrCpy $ServerEnabled  "true"
+
+    ; Thread defaults: floor(cores / 2), min 1.
+    ReadEnvStr $0 "NUMBER_OF_PROCESSORS"
+    ${If} $0 == ""
+        StrCpy $0 "4"
+    ${EndIf}
+    IntOp $Threads $0 / 2
+    ${If} $Threads < 1
+        StrCpy $Threads "1"
+    ${EndIf}
+
+    ; If an existing config.ini is present, extract previous values as defaults.
+    InitPluginsDir
+    File /oname=$PLUGINSDIR\config-generate.ps1 "@STAGING_DIR@\config-generate.ps1"
+    File /oname=$PLUGINSDIR\common-ini.ps1       "@STAGING_DIR@\common-ini.ps1"
+    Delete "$PLUGINSDIR\existing.ini"
+    nsExec::Exec 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\config-generate.ps1" -DumpIni "$PLUGINSDIR\existing.ini"'
+    Pop $0
+    ${If} ${FileExists} "$PLUGINSDIR\existing.ini"
+        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "ModelsFolder"
+        ${If} $0 != ""
+            StrCpy $ModelsFolder $0
+        ${EndIf}
+        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "ServerPort"
+        ${If} $0 != ""
+            StrCpy $ServerPort $0
+        ${EndIf}
+        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "ServerEnabled"
+        ${If} $0 != ""
+            StrCpy $ServerEnabled $0
+        ${EndIf}
+        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Settings" "Threads"
+        ${If} $0 != ""
+            StrCpy $Threads $0
+        ${EndIf}
+    ${EndIf}
+FunctionEnd
+Function un.onInit
+    SetRegView 64
+FunctionEnd
+
+; ── MUI pages ───────────────────────────────────────────────────────
+!insertmacro MUI_PAGE_WELCOME
+Page custom CheckPreviousInstall
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_COMPONENTS
+Page custom InstallConfigPage InstallConfigLeave
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+!insertmacro MUI_LANGUAGE "English"
+
+; ── Upgrade: remove previous installation silently ──────────────────
+Function CheckPreviousInstall
+    ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "UninstallString"
+    StrCmp $0 "" done
+
+    ReadRegStr $1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "DisplayVersion"
+    MessageBox MB_YESNO|MB_ICONQUESTION \
+        "stable-diffusion.cpp $1 is already installed.$\n$\nUninstall previous version before continuing?" \
+        IDYES uninstall
+
+    Abort
+
+    uninstall:
+        ; Strip surrounding quotes from UninstallString.
+        GetTempFileName $2 ""  "uninstall.exe"
+        ExecWait '"$0" /S _?=$INSTDIR'
+        Delete "$INSTDIR\uninstall.exe"
+        RMDir "$INSTDIR"
+    done:
+FunctionEnd
+
+; ── Main section: binaries and scripts ──────────────────────────────
+Section "stable-diffusion.cpp (required)" SecMain
+    SectionIn RO
+
+    SetOutPath "$INSTDIR\bin"
+    File /r "@STAGING_DIR@\bin\*.*"
+
+    SetOutPath "$INSTDIR"
+    File "@STAGING_DIR@\run-generate.ps1"
+    File "@STAGING_DIR@\config-model.ps1"
+    File "@STAGING_DIR@\config-generate.ps1"
+    File "@STAGING_DIR@\common-ini.ps1"
+
+    ; Write config.ini from install-time page values.
+    DetailPrint "Writing generation config..."
+    nsExec::ExecToLog 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\config-generate.ps1" -NonInteractive -ModelsFolder "$ModelsFolder" -ServerPort $ServerPort -ServerEnabled $ServerEnabled -Threads $Threads'
+
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+
+    ; Registry — Add/Remove Programs.
+    WriteRegStr HKLM "Software\stable-diffusion.cpp" "InstallDir" "$INSTDIR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "DisplayName"       "stable-diffusion.cpp @VERSION@"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "UninstallString"   "\"$INSTDIR\uninstall.exe\""
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "DisplayVersion"  "@VERSION@"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "Publisher"     "stable-diffusion.cpp"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "NoModify"  1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "NoRepair"  1
+SectionEnd
+
+; ── Optional: Add to system PATH ───────────────────────────────────
+Section "Add to system PATH" SecPath
+    nsExec::ExecToLog 'powershell -NoProfile -Command "\
+        $$regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(\
+            \"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\", $$true);\
+        $$path = $$regKey.GetValue(\"Path\", \"\", \"DoNotExpandEnvironmentNames\");\
+        $$dir = \"$INSTDIR\\bin\";\
+        if ($$path -not-like \"*$$dir*\") {\
+            $$regKey.SetValue(\"Path\", \"$$path;$$dir\", \"ExpandString\");\
+        };\
+        $$regKey.Close()"'
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+SectionEnd
+
+; ── Optional: Start Menu shortcuts ─────────────────────────────────
+Section "Start Menu shortcuts" SecShortcuts
+    CreateDirectory "$SMPROGRAMS\stable-diffusion.cpp"
+    SetOutPath "$LOCALAPPDATA\stable-diffusion.cpp"
+    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Generate Images.lnk"  "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\run-generate.ps1$\""
+    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Configure Generation.lnk"  "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\config-generate.ps1$\""
+    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Configure Model.lnk"  "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\config-model.ps1$\""
+    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Start SD Server.lnk"     "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\bin\sd-server.exe$\""
+    SetOutPath "$INSTDIR"
+    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Uninstall.lnk"   "$INSTDIR\uninstall.exe"
+    System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, p 0, p 0)'
+SectionEnd
+
+; ── Custom page: install-time config ────────────────────────────────
+Function InstallConfigPage
+    !insertmacro MUI_HEADER_TEXT "Installation Options" "Select the default models folder and configure optional SD Server."
+    nsDialogs::Create 1018
+    Pop $Hwnd
+    ${If} $Hwnd == error
+        Abort
+    ${EndIf}
+
+    ; Row 1 — Models folder path.
+    ${NSD_CreateLabel}     0 12u   40%      12u   "Models directory:"
+    Pop $Hwnd
+    ${NSD_CreateText}      0 26u   78%      12u   "$ModelsFolder"
+    Pop $ModelsFolderBox
+    ${NSD_CreateBrowseButton} 80% 26u        20%   12u "Browse..."
+    Pop $ModelsFolderBrowseBtn
+    ${NSD_OnClick} $ModelsFolderBrowseBtn OnBrowseModels
+
+    ; Row 2 — Thread count (read-only display of auto-detected value).
+    ${NSD_CreateLabel}  0 48u   100%     12u   "Default threads: $Threads  (auto-detected from $0 CPUs)"
+    Pop $Hwnd
+
+    ; Row 3 — SD Server enable checkbox.
+    ${NSD_CreateLabel}  0 68u   100%     12u   "SD Server (HTTP API for image generation requests):"
+    Pop $Hwnd
+    ${NSD_CreateCheckBox} 0 82u 60%      14u   "Enable sd-server on startup"
+    Pop $ServerEnabledCheck
+    ${If} $ServerEnabled == "true"
+        ${NSD_SetState} $ServerEnabledCheck ${BST_CHECKED}
+    ${EndIf}
+
+    nsDialogs::Show
+FunctionEnd
+
+Function OnBrowseModels
+    ${NSD_GetText} $ModelsFolderBox $0
+    nsDialogs::SelectFolderDialog "Select the folder where your SD model files (.gguf, .safetensors, .ckpt) are stored" "$0"
+    Pop $0
+    ${If} $0 != error
+        ${NSD_SetText} $ModelsFolderBox "$0"
+    ${EndIf}
+FunctionEnd
+
+Function InstallConfigLeave
+    ${NSD_GetText}   $ModelsFolderBox $ModelsFolder
+    ${NSD_GetState}  $ServerEnabledCheck $0
+    ${If} $0 = ${BST_CHECKED}
+        StrCpy $ServerEnabled "true"
+    ${Else}
+        StrCpy $ServerEnabled "false"
+    ${EndIf}
+FunctionEnd
+
+; ── Section descriptions ────────────────────────────────────────────
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecMain}       "Core sd-cli executable and runtime scripts."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecPath}     "Add stable-diffusion.cpp bin directory to system PATH."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Start Menu shortcuts: Generate Images, Configure Generation/Model, SD Server."
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+; ── Uninstaller ─────────────────────────────────────────────────────
+Section "Uninstall"
+    ; Remove from PATH.
+    nsExec::ExecToLog 'powershell -NoProfile -Command "\
+        $$regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(\
+            \"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\", $$true);\
+        $$path = $$regKey.GetValue(\"Path\", \"\", \"DoNotExpandEnvironmentNames\");\
+        $$dir = \"$INSTDIR\\bin\";\
+        $$newPath = ($$path -split \";\" | Where-Object { $$_ ne $$dir }) -join \";\"\
+        $$regKey.SetValue(\"Path\", $$newPath, \"ExpandString\");\
+        $$regKey.Close()"'
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
+    ; Files.
+    RMDir /r "$INSTDIR\bin"
+    Delete "$INSTDIR\run-generate.ps1"
+    Delete "$INSTDIR\config-model.ps1"
+    Delete "$INSTDIR\config-generate.ps1"
+    Delete "$INSTDIR\common-ini.ps1"
+    Delete "$INSTDIR\uninstall.exe"
+    RMDir "$INSTDIR"
+
+    ; Start Menu.
+    Delete "$SMPROGRAMS\stable-diffusion.cpp\*.lnk"
+    RMDir "$SMPROGRAMS\stable-diffusion.cpp"
+
+    ; Registry.
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp"
+    DeleteRegKey HKLM "Software\stable-diffusion.cpp"
+
+    ; User data (configs + logs). Ask; default keeps them for reinstall safety.
+    StrCpy $0 "$LOCALAPPDATA\stable-diffusion.cpp"
+    IfFileExists "$0\config\config.ini" 0 skip_user_data
+    MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 \
+        "Delete user configuration at $0?$\n$\nThis includes generation settings and per-model configs. Choose No to keep them for a future reinstall." \
+        /SD IDNO IDNO skip_user_data
+    RMDir /r "$0"
+    skip_user_data:
+SectionEnd
