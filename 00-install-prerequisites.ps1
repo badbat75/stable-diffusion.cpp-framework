@@ -1,8 +1,8 @@
 # Install & update the stable-diffusion.cpp build toolchain in one shot.
 #
 # winget packages (PowerShell 7+, NSIS) are installed if missing and
-# upgraded if present, in a single self-elevated session. GPU SDKs (CUDA,
-# Vulkan, HIP) are only probed and their install URLs printed.
+# upgraded if present, in a single self-elevated session. Manual SDKs (CUDA,
+# Vulkan, AMD HIP) are only probed and their install URLs printed.
 #
 # When build\config-build.psd1 + stable-diffusion.cpp clone exist, also runs
 # `git pull --ff-only` on the source and flags a rebuild if the commit moved.
@@ -21,13 +21,16 @@ function Test-IsAdmin {
 
 function Get-WingetVersion {
     param([string]$Id)
+    # winget's table output is locale-dependent and the column order puts Name
+    # first (e.g. "PowerShell  Microsoft.PowerShell  7.4.6.0  ..."), so match
+    # the Id token anywhere on the line and return the next whitespace-separated
+    # token as the version.
     $output = winget list --id $Id --exact --accept-source-agreements 2>&1 | Out-String
     foreach ($line in ($output -split "`r?`n")) {
-        if ($line.Contains($Id)) {
-            $cols = $line -split '\s+'
-            for ($i = 0; $i -lt $cols.Count; $i++) {
-                if ($cols[$i] -eq $Id -and $i + 1 -lt $cols.Count) { return $cols[$i + 1].Trim() }
-            }
+        if (-not $line.Contains($Id)) { continue }
+        $cols = $line -split '\s+' | Where-Object { $_ }
+        for ($i = 0; $i -lt $cols.Count - 1; $i++) {
+            if ($cols[$i] -eq $Id) { return $cols[$i + 1].Trim() }
         }
     }
     return $null
@@ -49,19 +52,19 @@ $wingetPackages = @(
 )
 
 $manualSdks = @(
-    @{ Name = 'CUDA Toolkit'      ; Url = 'https://developer.nvidia.com/cuda-downloads'
+    @{ Name = 'CUDA Toolkit'; Url = 'https://developer.nvidia.com/cuda-downloads'
        Probe = { Test-Path "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\*\bin\nvcc.exe" } }
-    @{ Name = 'Vulkan SDK'        ; Url = 'https://vulkan.lunarg.com/sdk/home'
+    @{ Name = 'Vulkan SDK'  ; Url = 'https://vulkan.lunarg.com/sdk/home'
        Probe = { ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) -or (Test-Path "${env:ProgramFiles}\VulkanSDK\*\Bin\glslc.exe") } }
-    @{ Name = 'AMD HIP SDK'       ; Url = 'https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html'
+    @{ Name = 'AMD HIP SDK' ; Url = 'https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html'
        Probe = { Test-Path "${env:ProgramFiles}\AMD\ROCm\*\bin\hipcc.exe" } }
 )
 
 # ── Banner ──────────────────────────────────────────────────────────
 
 Write-Host ""
-Write-Host "  stable-diffusion.cpp — Install & Update Toolchain" -ForegroundColor Cyan
-Write-Host "  ===================================================" -ForegroundColor Cyan
+Write-Host "  stable-diffusion.cpp-framework — Install & Update Toolchain" -ForegroundColor Cyan
+Write-Host "  ===========================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Capture pre-state ───────────────────────────────────────────────
@@ -77,7 +80,7 @@ foreach ($p in $wingetPackages) {
 }
 
 $cfgPath = Join-Path $PSScriptRoot 'build\config-build.psd1'
-$cfg     = if (Test-Path $cfgPath) { Import-PowerShellDataFile $cfgPath } else { $null }
+$cfg = if (Test-Path $cfgPath) { Import-PowerShellDataFile $cfgPath } else { $null }
 $beforeSd = if ($cfg) { Get-GitCommit $cfg.StableDiffusionCppDir } else { $null }
 
 foreach ($p in $wingetPackages) {
@@ -93,24 +96,28 @@ Write-Host ""
 
 # ── Build the elevated batch (winget install + upgrade) ─────────────
 
-$wingetCommands = @()
+$blocks = @()
 foreach ($p in $missing) {
-    $wingetCommands += "Write-Host 'Installing $($p.Name)...' -ForegroundColor Cyan"
-    $wingetCommands += "winget install --id $($p.Id) --exact --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null"
+    $blocks += "Write-Host 'Installing $($p.Name)...' -ForegroundColor Cyan"
+    $blocks += "winget install --id $($p.Id) --exact --silent --accept-source-agreements --accept-package-agreements"
 }
 foreach ($p in $present) {
-    $wingetCommands += "Write-Host 'Upgrading $($p.Name)...' -ForegroundColor Cyan"
-    $wingetCommands += "winget upgrade --id $($p.Id) --exact --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null"
+    $blocks += "Write-Host 'Upgrading $($p.Name)...' -ForegroundColor Cyan"
+    $blocks += "winget upgrade --id $($p.Id) --exact --silent --accept-source-agreements --accept-package-agreements"
 }
+$script = $blocks -join "`n"
 
-if ($wingetCommands.Count -gt 0) {
+if ($blocks.Count -gt 0) {
     if (Test-IsAdmin) {
-        & ([scriptblock]::Create($wingetCommands -join "`n"))
+        & ([scriptblock]::Create($script))
     } else {
         Write-Host "Requesting administrator privileges for winget..." -ForegroundColor Yellow
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wingetCommands -join "`n"))
-        Start-Process powershell -Verb RunAs -Wait `
-            -ArgumentList "-ExecutionPolicy Bypass -EncodedCommand $encoded" | Out-Null
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        $proc = Start-Process powershell -Verb RunAs -Wait -PassThru `
+            -ArgumentList "-ExecutionPolicy Bypass -EncodedCommand $encoded"
+        if ($proc.ExitCode -ne 0) {
+            Write-Host "Elevated session exited with code $($proc.ExitCode)" -ForegroundColor Red
+        }
     }
 }
 
@@ -122,6 +129,10 @@ if ($cfg -and $beforeSd) {
     git -C $cfg.StableDiffusionCppDir pull --ff-only
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  git pull failed in $($cfg.StableDiffusionCppDir)" -ForegroundColor Yellow
+    }
+    # Submodules track ggml — keep them in sync after a pull.
+    if (Test-Path "$($cfg.StableDiffusionCppDir)\.gitmodules") {
+        git -C $cfg.StableDiffusionCppDir submodule update --init --recursive | Out-Null
     }
 }
 
@@ -135,7 +146,7 @@ $afterSd = if ($cfg) { Get-GitCommit $cfg.StableDiffusionCppDir } else { $null }
 
 Write-Host ""
 Write-Host "  Update Report" -ForegroundColor Cyan
-Write-Host "  ====" -ForegroundColor Cyan
+Write-Host "  =============" -ForegroundColor Cyan
 Write-Host ""
 
 function Write-ReportRow {
@@ -155,7 +166,7 @@ foreach ($p in $wingetPackages) {
 
 $rebuildSd = $false
 if      (-not $beforeSd)              { Write-ReportRow "[--]" DarkGray "stable-diffusion.cpp" "(not cloned)" }
-elseif  ($beforeSd -ne $afterSd)     { Write-ReportRow "[++]" Green    "stable-diffusion.cpp" "$beforeSd -> $afterSd"; $rebuildSd = $true }
+elseif  ($beforeSd -ne $afterSd)      { Write-ReportRow "[++]" Green    "stable-diffusion.cpp" "$beforeSd -> $afterSd"; $rebuildSd = $true }
 else                                  { Write-ReportRow "[OK]" DarkGray "stable-diffusion.cpp" $beforeSd }
 
 Write-Host ""
@@ -168,11 +179,11 @@ foreach ($s in $manualSdks) {
 
 Write-Host ""
 if (-not $cfg) {
-    Write-Host "  Next: .\01-configure.ps1   # detect paths and generate config-build.psd1" -ForegroundColor Cyan
+    Write-Host "  Next: .\01-configure.ps1   # detect paths and generate build\config-build.psd1" -ForegroundColor Cyan
 } elseif ($rebuildSd) {
     Write-Host "  Recommended actions:" -ForegroundColor Yellow
-    Write-Host "    .\02-build.ps1              # stable-diffusion.cpp source updated" -ForegroundColor Yellow
-    Write-Host "    .\03-package.ps1            # rebuild installer afterwards" -ForegroundColor Yellow
+    Write-Host "    .\02-build.ps1            # stable-diffusion.cpp source updated" -ForegroundColor Yellow
+    Write-Host "    .\03-package.ps1          # rebuild installer afterwards" -ForegroundColor Yellow
 } else {
     Write-Host "  Toolchain up to date." -ForegroundColor Green
 }

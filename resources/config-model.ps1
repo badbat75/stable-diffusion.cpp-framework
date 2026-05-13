@@ -1,129 +1,407 @@
-# Interactive wizard to add/edit per-model settings in models.ini.
-# Saves parameters under a named section keyed by the model base filename (without .gguf/.safetensors).
+# Per-model preset builder for sd-server.
 #
-# Usage:
-#   .\config-model.ps1                    # interactive — pick existing model or enter new name
-#   .\config-model.ps1 -ModelName "my-sd"  # direct edit of named section
+# Operates directly on %LOCALAPPDATA%\stable-diffusion.cpp\config\presets.ini —
+# the file consumed by `run-server.ps1` to translate one preset section into
+# sd-server CLI args at launch time. Each [section] in the INI is one preset;
+# the section name is the id shown in the launcher's model picker.
+#
+# This script edits exactly one section at a time. Other sections in the file —
+# including any custom keys you've hand-added, comments, and ordering — are
+# preserved byte-for-byte. The section being edited is rewritten in full from
+# the wizard's answers, so any custom keys IN THAT SECTION will be lost; if you
+# want exotic flags on a preset, set them up via the wizard first, then add
+# the exotic keys by hand and don't re-run the wizard for that preset.
 
 [CmdletBinding()]
-param([string]$ModelName)
+param()
 
 $ErrorActionPreference = 'Stop'
 
-$configDir     = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config"
-$modelsIni     = Join-Path $configDir "models.ini"
+. (Join-Path $PSScriptRoot "common-functions.ps1")
 
-. (Join-Path $PSScriptRoot "common-ini.ps1")
+$configDir   = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config"
+$serverPath  = Join-Path $configDir "server.ini"
+$presetsPath = Join-Path $configDir "presets.ini"
 
-if ($ModelName) { Write-Host "--- Editing model: $ModelName ---" -ForegroundColor Cyan }
-
-function Edit-ModelSection {
-    param([string]$name)
-
-    # Discover current models for default prompt list
-    $modelsFolder = ""
-    if (Test-Path (Join-Path $configDir "config.ini")) {
-        . (Join-Path $PSScriptRoot "common-ini.ps1")
-        $cfg = Read-ConfigIni -Path (Join-Path $configDir "config.ini")
-        if ($cfg['ModelsFolder']) { $modelsFolder = $cfg['ModelsFolder'] }
-    }
-
-    function Get-SuggestedFiles {
-        $files = @()
-        foreach ($ext in @('*.gguf', '*.safetensors')) {
-            if (Test-Path $modelsFolder) {
-                foreach ($f in (Get-ChildItem -LiteralPath $modelsFolder -Filter $ext -ErrorAction SilentlyContinue)) {
-                    $files += [PSCustomObject]@{ Name = $f.Name; Basename = $f.BaseName; Full = $f.FullName }
-                }
-            }
-        }
-        return $files | Sort-Object Basename
-    }
-
+if (-not (Test-Path $serverPath)) {
     Write-Host ""
-    Write-Host "--- Model Settings: $name ---" -ForegroundColor Cyan
-    if ($modelsFolder) {
-        Write-Host "  Scanning models folder: $modelsFolder" -ForegroundColor DarkGray
-        $suggested   = Get-SuggestedFiles
-        if ($suggested.Count -gt 0) {
-            Write-Host ""
-            Write-Host "  Known models:" -ForegroundColor DarkGray
-            foreach ($i in 0..($suggested.Count - 1)) {
-                Write-Host "    [$(($i+1).ToString())] $($suggested[$i].Basename) → $($suggested[$i].Name)" -ForegroundColor DarkGray
-            }
+    Write-Host "  No server.ini at $serverPath" -ForegroundColor Yellow
+    Write-Host "  Run config-server.ps1 first to set up sd-server." -ForegroundColor Yellow
+    Write-Host ""
+    return
+}
+New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+$serverCfg = Read-ServerIni -Path $serverPath
+
+# ── Prompt helpers (Enter = default; `-` = unset for optional fields) ──
+
+function Read-IntDefault {
+    param([string]$Prompt, $Default, [int]$Min = 0, [int]$Max = [int]::MaxValue, [switch]$AllowUnset)
+    while ($true) {
+        $shown = if ($null -eq $Default) { 'unset' } else { "$Default" }
+        $reply = Read-Host "$Prompt [$shown]"
+        if (-not $reply) { return $Default }
+        if ($AllowUnset -and $reply -eq '-') { return $null }
+        [int]$parsed = 0
+        if ([int]::TryParse($reply, [ref]$parsed) -and $parsed -ge $Min -and $parsed -le $Max) {
+            return $parsed
         }
-        $filePath    = Read-Host "  Model file path (full path to .gguf/.safetensors, or Enter for none)"
-    } else {
-        Write-Host ""
-        Write-Host "  No models config found. Setting up fresh entry." -ForegroundColor DarkGray
-        $filePath    = Read-Host "  Model file path (full path to .gguf/.safetensors)"
+        Write-Host "  Invalid value (expected $Min-$Max$(if ($AllowUnset) { ' or `-` to unset' }))." -ForegroundColor Yellow
     }
-
-    # Ask generation defaults for this model
-    $prompt      = Read-Host "  Prompt (default positive prompt; can override on generate)"
-    $negPrompt   = Read-Host "  Negative prompt"
-
-    $v   = Read-Host "  Width [$($cfg['Width'] ?? 512)]"; if (-not $v) { $v = '512' }
-    $width       = [int]$v
-    $v   = Read-Host "  Height [$($cfg['Height'] ?? 512)]"; if (-not $v) { $v = '512' }
-    $height      = [int]$v
-    $v   = Read-Host "  Steps [$($cfg['Steps'] ?? 20)]"; if (-not $v) { $v = '20' }
-    $steps       = [int]$v
-    $v   = Read-Host "  CFG Scale [$($cfg['CFG'] ?? 7.5)]"; if (-not $v) { $v = '7.5' }
-    $cfgScale    = [double]$v
-    $smp   = Read-Host "  Sampling Method [k_euler]"; if (-not $smp) { $smp = 'k_euler' }
-    $seedInput   = Read-Host "  Seed [-1 for random]"; if (-not $seedInput) { $seedInput = '-1' }
-    if ($seedInput -notmatch '^\-?\d+$') { Write-Host "Invalid seed, using -1." -ForegroundColor Yellow; $seedInput = '-1' }
-
-    $data        = @{
-        'FilePath'     = if ($filePath) { $filePath } else { '(none)' }
-        'Prompt'       = if ($prompt) { $prompt } else { '(none)' }
-        'NegativePrompt'  =  if ($negPrompt) { $negPrompt } else { '(none)' }
-        'Width'        = '$width'
-        'Height'       = '$height'
-        'Steps'        = '$steps'
-        'CFG'          = '$cfgScale'
-        'SampleMethod'    =   $smp
-        'Seed'         =  '$seedInput'
-    }
-
-    if (-not (Test-Path (Split-Path -Parent $modelsIni))) {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $modelsIni) -Force | Out-Null
-    }
-
-    Write-ModelSection -Path $modelsIni -SectionName $name -Data $data
-    Write-Host "  Model config saved to: $modelsIni" -ForegroundColor Green
 }
 
-# Gather model name if not provided
-if (-not $ModelName) {
-    # List existing entries in models.ini
-    $existingSections = @()
-    if (Test-Path $modelsIni) {
-        $content   = Get-Content -LiteralPath $modelsIni -Raw -Encoding UTF8
-        $sectionRegex  = [regex]'\[(.+?)\]'
-        foreach ($m in ($sectionRegex.Matches($content))) {
-            $existingSections += $Matches[1].Trim()
+function Read-FloatDefault {
+    param([string]$Prompt, $Default, [switch]$AllowUnset)
+    while ($true) {
+        $shown = if ($null -eq $Default) { 'unset' } else { "$Default" }
+        $reply = Read-Host "$Prompt [$shown]"
+        if (-not $reply) { return $Default }
+        if ($AllowUnset -and $reply -eq '-') { return $null }
+        [double]$parsed = 0
+        if ([double]::TryParse($reply, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+            return $parsed
         }
+        Write-Host "  Invalid number." -ForegroundColor Yellow
     }
-
-    Write-Host ""
-    Write-Host "Current models.ini entries:" -ForegroundColor Cyan
-    if ($existingSections.Count -eq 0) {
-        Write-Host "  (none)" -ForegroundColor DarkGray
-    } else {
-        foreach ($sec in $existingSections) {
-            Write-Host "  [?] $sec" -ForegroundColor DarkGray
-        }
-    }
-
-    $choice  = Read-Host "Select existing or type new section name"
-    if ($existingSections.Count -ge 0 -and $existingSections.Count -le 9 -and "$choice" -match '^\d+$' -and [int]$choice -le $existingSections.Count) {
-        $ModelName = $existingSections[[int]$choice - 1]
-    } else {
-        $ModelName = $choice
-    }
-    if (-not $ModelName) { Write-Host "No model name provided. Exiting." -ForegroundColor Yellow; exit 0 }
 }
 
-Edit-ModelSection -name $ModelName
+function Read-BoolDefault {
+    param([string]$Prompt, [bool]$Default)
+    while ($true) {
+        $shown = if ($Default) { 'Y/n' } else { 'y/N' }
+        $reply = Read-Host "$Prompt [$shown]"
+        if (-not $reply) { return $Default }
+        if ($reply -match '^[yY]') { return $true }
+        if ($reply -match '^[nN]') { return $false }
+        Write-Host "  Invalid (y/n)." -ForegroundColor Yellow
+    }
+}
+
+function Read-StringDefault {
+    param([string]$Prompt, $Default, [switch]$AllowUnset)
+    $shown = if (-not $Default) { 'unset' } else { $Default }
+    $reply = Read-Host "$Prompt [$shown]"
+    if (-not $reply) { return $Default }
+    if ($AllowUnset -and $reply -eq '-') { return $null }
+    return $reply
+}
+
+function Read-EnumDefault {
+    param([string]$Prompt, [string]$Default, [string[]]$Choices, [switch]$AllowUnset)
+    $list = $Choices -join '/'
+    while ($true) {
+        $shown = if ($null -eq $Default -or $Default -eq '') { 'unset' } else { $Default }
+        $reply = Read-Host "$Prompt ($list) [$shown]"
+        if (-not $reply) { return $Default }
+        if ($AllowUnset -and $reply -eq '-') { return $null }
+        if ($Choices -contains $reply) { return $reply }
+        Write-Host "  Invalid (one of: $list)." -ForegroundColor Yellow
+    }
+}
+
+# Stable filesystem-safe id per model: basename without extension, without
+# multi-shard suffix, with non-alphanumerics collapsed to underscores.
+function Get-ModelId {
+    param([string]$ModelPath)
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($ModelPath)
+    $base = $base -replace '-\d{5}-of-\d{5}$', ''
+    return ($base -replace '[^a-zA-Z0-9._-]+', '_')
+}
+
+# ── INI section parsing ──────────────────────────────────────────────
+# Returns each section as { Id; Text } where Text is the verbatim slice from
+# `[id]` up to (but not including) the next section header. Used both to
+# detect which models are already configured (for the `*` marker) and to
+# pre-fill prompt defaults from the active section.
+
+function Get-IniSections {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return @() }
+    $text = Get-Content -Path $Path -Raw -Encoding UTF8
+    if (-not $text) { return @() }
+    $sections = @()
+    foreach ($m in [regex]::Matches($text, '(?m)^\[(?<id>[^\]\r\n]+)\][\s\S]*?(?=^\[|\z)')) {
+        $sections += [pscustomobject]@{
+            Id     = $m.Groups['id'].Value.Trim()
+            Text   = $m.Value
+            Index  = $m.Index
+            Length = $m.Length
+        }
+    }
+    return $sections
+}
+
+function Get-IniSectionKeys {
+    param([pscustomobject]$Section)
+    $result = @{}
+    if (-not $Section) { return $result }
+    foreach ($line in ($Section.Text -split "(?:\r\n|\n)")) {
+        $t = $line.Trim()
+        if ($t -eq '' -or $t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[')) { continue }
+        if ($t -match '^([^=]+?)\s*=\s*(.*)$') {
+            $result[$Matches[1].Trim()] = $Matches[2].Trim()
+        }
+    }
+    return $result
+}
+
+Write-Host ""
+Write-Host "── stable-diffusion.cpp model preset ──" -ForegroundColor Cyan
+Write-Host ""
+
+# 1) Models directory
+$defaultModelsDir = if ($serverCfg['ModelsDir']) { $serverCfg['ModelsDir'] } else { Join-Path $env:USERPROFILE ".stable-diffusion.cpp\models" }
+$modelsDir = $null
+while (-not $modelsDir) {
+    $reply = Read-Host "Models directory [$defaultModelsDir]"
+    if (-not $reply) { $reply = $defaultModelsDir }
+    if (Test-Path $reply -PathType Container) {
+        $modelsDir = (Resolve-Path $reply).Path
+    } else {
+        Write-Host "  Directory not found. Try again or Ctrl+C to abort." -ForegroundColor Yellow
+    }
+}
+
+# 2) Scan .gguf / .safetensors files (recursive). For multi-shard models,
+#    only show the first shard.
+Write-Host ""
+Write-Host "Scanning $modelsDir for .gguf / .safetensors models..." -ForegroundColor DarkGray
+$models = Get-ChildItem -Path $modelsDir -Include @('*.gguf', '*.safetensors') -Recurse -File `
+    | Where-Object { $_.Name -notmatch '-\d{5}-of-\d{5}\.(gguf|safetensors)$' -or $_.Name -match '-00001-of-\d{5}\.(gguf|safetensors)$' } `
+    | Sort-Object FullName
+
+if ($models.Count -eq 0) {
+    throw "No .gguf or .safetensors files found under $modelsDir."
+}
+
+# 3) Read existing presets so already-configured models get a `*` marker.
+#    Matching is by the file path stored in each section's `diffusion-model`
+#    or `model` key — not by section name — so user-renamed sections still
+#    light up the marker (and feed defaults into the wizard below).
+$sections = @(Get-IniSections -Path $presetsPath)
+
+function Get-NormalizedPath {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    try { return ([System.IO.Path]::GetFullPath($Path)).ToLowerInvariant() }
+    catch { return $Path.ToLowerInvariant() }
+}
+
+$sectionsByPath = @{}
+foreach ($s in $sections) {
+    $sk = Get-IniSectionKeys -Section $s
+    $p = if ($sk['diffusion-model']) { $sk['diffusion-model'] } elseif ($sk['model']) { $sk['model'] } else { $null }
+    $np = Get-NormalizedPath $p
+    if ($np -and -not $sectionsByPath.ContainsKey($np)) { $sectionsByPath[$np] = $s }
+}
+
+Write-Host ""
+Write-Host "Available models:" -ForegroundColor Cyan
+for ($i = 0; $i -lt $models.Count; $i++) {
+    $sizeGb  = [math]::Round($models[$i].Length / 1GB, 2)
+    $relPath = $models[$i].FullName.Substring($modelsDir.Length).TrimStart('\', '/')
+    $np      = Get-NormalizedPath $models[$i].FullName
+    $marker  = if ($sectionsByPath.ContainsKey($np)) { '*' } else { ' ' }
+    Write-Host ("  [{0,2}]{1} {2}  ({3} GB)" -f ($i + 1), $marker, $relPath, $sizeGb)
+}
+Write-Host ""
+Write-Host "  (* = already a preset section in presets.ini)" -ForegroundColor DarkGray
+
+# 4) Selection
+$selected = $null
+while (-not $selected) {
+    $reply = Read-Host "`nSelect model [1-$($models.Count)]"
+    [int]$idx = 0
+    if ([int]::TryParse($reply, [ref]$idx) -and $idx -ge 1 -and $idx -le $models.Count) {
+        $selected = $models[$idx - 1]
+    } else {
+        Write-Host "  Invalid selection." -ForegroundColor Yellow
+    }
+}
+
+$modelId = Get-ModelId $selected.FullName
+$selectedPath = Get-NormalizedPath $selected.FullName
+$existingSection = if ($sectionsByPath.ContainsKey($selectedPath)) {
+    $sectionsByPath[$selectedPath]
+} else {
+    $sections | Where-Object { $_.Id -eq $modelId } | Select-Object -First 1
+}
+# Preserve a hand-renamed section name instead of overwriting it with the
+# filename-derived id.
+if ($existingSection) { $modelId = $existingSection.Id }
+$cur = Get-IniSectionKeys -Section $existingSection
+
+# Convert string defaults read from INI into typed values for the prompts.
+function ConvertTo-IntOrNull   { param($v) if ($v) { $p=0; if ([int]::TryParse($v, [ref]$p)) { return $p } } return $null }
+function ConvertTo-FloatOrNull { param($v) if ($v) { $p=[double]0; if ([double]::TryParse($v, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$p)) { return $p } } return $null }
+function ConvertTo-BoolOrNull  { param($v) if ($v -eq 'true') { $true } elseif ($v -eq 'false') { $false } else { $null } }
+
+# Sub-model paths
+$curDiffusion = if ($cur.ContainsKey('diffusion-model')) { $cur['diffusion-model'] } else { $null }
+$curVae       = if ($cur.ContainsKey('vae'))             { $cur['vae'] }             else { $null }
+$curLlm       = if ($cur.ContainsKey('llm'))             { $cur['llm'] }             else { $null }
+$curT5xxl     = if ($cur.ContainsKey('t5xxl'))           { $cur['t5xxl'] }           else { $null }
+$curClipL     = if ($cur.ContainsKey('clip_l'))          { $cur['clip_l'] }          else { $null }
+$curClipG     = if ($cur.ContainsKey('clip_g'))          { $cur['clip_g'] }          else { $null }
+$curLoraDir   = if ($cur.ContainsKey('lora-model-dir'))  { $cur['lora-model-dir'] }  else { $null }
+$curEmbdDir   = if ($cur.ContainsKey('embd-dir'))        { $cur['embd-dir'] }        else { $null }
+# Memory / perf knobs
+$curWeightType= if ($cur.ContainsKey('type'))            { $cur['type'] }            else { $null }
+$curOffload   = ConvertTo-BoolOrNull  $cur['offload-to-cpu']
+$curMmap      = ConvertTo-BoolOrNull  $cur['mmap']
+$curFa        = ConvertTo-BoolOrNull  $cur['fa']
+$curDiffFa    = ConvertTo-BoolOrNull  $cur['diffusion-fa']
+$curClipOnCpu = ConvertTo-BoolOrNull  $cur['clip-on-cpu']
+$curVaeOnCpu  = ConvertTo-BoolOrNull  $cur['vae-on-cpu']
+$curVaeTiling = ConvertTo-BoolOrNull  $cur['vae-tiling']
+$curMaxVram   = ConvertTo-FloatOrNull $cur['max-vram']
+# Default generation params (the web UI lets users override per-request)
+$curSampler   = if ($cur.ContainsKey('sampler')) { $cur['sampler'] } else { $null }
+$curSteps     = ConvertTo-IntOrNull   $cur['steps']
+$curCfg       = ConvertTo-FloatOrNull $cur['cfg-scale']
+$curGuidance  = ConvertTo-FloatOrNull $cur['guidance']
+$curWidth     = ConvertTo-IntOrNull   $cur['width']
+$curHeight    = ConvertTo-IntOrNull   $cur['height']
+
+# 5) Prompt for all per-model parameters
+Write-Host ""
+Write-Host "Selected: $($selected.FullName)" -ForegroundColor Green
+Write-Host "Preset id: $modelId" -ForegroundColor Green
+Write-Host "Press Enter to accept the default; type '-' to unset an optional field." -ForegroundColor DarkGray
+Write-Host ""
+
+Write-Host "── Sub-model paths ──" -ForegroundColor Cyan
+Write-Host "  Required when using --diffusion-model (not -m). The required set depends on" -ForegroundColor DarkGray
+Write-Host "  the model architecture:" -ForegroundColor DarkGray
+Write-Host "    *  --vae      SD3, Flux, Flux2, Wan, Qwen-Image" -ForegroundColor DarkGray
+Write-Host "    *  --llm      Flux2 (mistral-small-3.2), Qwen-Image (qwen2.5vl), Z-Image (qwen3)" -ForegroundColor DarkGray
+Write-Host "    *  --t5xxl    SD3, Flux, Wan, Chroma" -ForegroundColor DarkGray
+Write-Host "    *  --clip_l   SD3, Flux" -ForegroundColor DarkGray
+Write-Host "    *  --clip_g   SD3" -ForegroundColor DarkGray
+Write-Host "  If -m points at an all-in-one bundle (typical for SD1.x/SDXL), leave these unset." -ForegroundColor DarkGray
+Write-Host ""
+$diffusionModel = Read-StringDefault "   Standalone diffusion model (--diffusion-model)" $curDiffusion -AllowUnset
+$vae            = Read-StringDefault " * VAE (--vae)"                                    $curVae       -AllowUnset
+$llm            = Read-StringDefault " * LLM text encoder (--llm)"                       $curLlm       -AllowUnset
+$t5xxl          = Read-StringDefault " * T5-XXL text encoder (--t5xxl)"                  $curT5xxl     -AllowUnset
+$clipL          = Read-StringDefault " * CLIP-L text encoder (--clip_l)"                 $curClipL     -AllowUnset
+$clipG          = Read-StringDefault " * CLIP-G text encoder (--clip_g)"                 $curClipG     -AllowUnset
+$loraDir        = Read-StringDefault "   LoRA model directory (--lora-model-dir)"        $curLoraDir   -AllowUnset
+$embdDir        = Read-StringDefault "   Embeddings directory (--embd-dir)"              $curEmbdDir   -AllowUnset
+
+Write-Host ""
+Write-Host "── Memory / performance ──" -ForegroundColor Cyan
+$weightType = Read-EnumDefault "Weight type (--type)" $(if ($curWeightType) { $curWeightType } else { '' }) @('f32','f16','q8_0','q5_1','q5_0','q4_1','q4_0','q2_K','q3_K','q4_K') -AllowUnset
+$offload    = Read-BoolDefault "Offload weights to CPU (--offload-to-cpu)" $(if ($null -ne $curOffload) { $curOffload } else { $false })
+$mmap       = Read-BoolDefault "Memory-map weights (--mmap)" $(if ($null -ne $curMmap) { $curMmap } else { $false })
+$fa         = Read-BoolDefault "Flash Attention everywhere (--fa)" $(if ($null -ne $curFa) { $curFa } else { $false })
+$diffFa     = Read-BoolDefault "Flash Attention in diffusion only (--diffusion-fa)" $(if ($null -ne $curDiffFa) { $curDiffFa } else { $true })
+$clipOnCpu  = Read-BoolDefault "Keep CLIP on CPU (--clip-on-cpu)" $(if ($null -ne $curClipOnCpu) { $curClipOnCpu } else { $false })
+$vaeOnCpu   = Read-BoolDefault "Keep VAE on CPU (--vae-on-cpu)" $(if ($null -ne $curVaeOnCpu) { $curVaeOnCpu } else { $false })
+$vaeTiling  = Read-BoolDefault "VAE tiled decode (--vae-tiling; recommended for high-res output)" $(if ($null -ne $curVaeTiling) { $curVaeTiling } else { $false })
+$maxVram    = Read-FloatDefault "Max VRAM budget in GiB (--max-vram; 0 = unlimited)" $curMaxVram -AllowUnset
+
+Write-Host ""
+Write-Host "── Default generation params (web UI can override per request) ──" -ForegroundColor Cyan
+$sampler = Read-EnumDefault "Sampler (--sampler)" $(if ($curSampler) { $curSampler } else { 'euler_a' }) `
+    @('euler_a','euler','heun','dpm2','dpm++2s_a','dpm++2m','dpm++2mv2','lcm','ipndm','ipndm_v','ddim_trailing','tcd')
+$steps   = Read-IntDefault   "Steps (--steps)"          $(if ($curSteps)  { $curSteps }  else { 20 })  -Min 1 -Max 200
+$cfg     = Read-FloatDefault "CFG scale (--cfg-scale)"  $(if ($null -ne $curCfg) { $curCfg }    else { 7.0 })
+$guidance= Read-FloatDefault "Distilled guidance (--guidance; Flux/Flux2 only, default 3.5)" $curGuidance -AllowUnset
+$width   = Read-IntDefault   "Width (-W)"               $(if ($curWidth)  { $curWidth }  else { 512 }) -Min 64 -Max 8192
+$height  = Read-IntDefault   "Height (-H)"              $(if ($curHeight) { $curHeight } else { 512 }) -Min 64 -Max 8192
+
+# 6) Build the new section text. Set values are emitted as live keys; unset
+#    optional values are emitted as commented placeholders so the user can
+#    discover them later.
+function Emit-Setting {
+    param([System.Text.StringBuilder]$Sb, [string]$Key, $Value, [string]$Example = $null)
+    if ($null -eq $Value -or ($Value -is [string] -and $Value -eq '')) {
+        if ($Example) { [void]$Sb.AppendLine("; $Key = $Example") }
+        return
+    }
+    [void]$Sb.AppendLine("$Key = $Value")
+}
+function Emit-Bool {
+    param([System.Text.StringBuilder]$Sb, [string]$Key, $Value)
+    if ($null -eq $Value) { return }
+    [void]$Sb.AppendLine("$Key = $(if ($Value) { 'true' } else { 'false' })")
+}
+
+$sb = [System.Text.StringBuilder]::new()
+[void]$sb.AppendLine("[$modelId]")
+[void]$sb.AppendLine("; Generated by config-model.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm').")
+[void]$sb.AppendLine('; Re-running the wizard rewrites this section; hand-edits to OTHER sections')
+[void]$sb.AppendLine('; in this file are preserved. To add exotic sd-server flags, edit by hand and')
+[void]$sb.AppendLine('; do not re-run the wizard for this preset.')
+[void]$sb.AppendLine('')
+[void]$sb.AppendLine('; Primary model file (-m). Use diffusion-model below if you have a standalone')
+[void]$sb.AppendLine('; UNet that needs an external VAE / text encoder.')
+[void]$sb.AppendLine("model = $($selected.FullName)")
+[void]$sb.AppendLine('')
+[void]$sb.AppendLine('; Sub-model paths')
+Emit-Setting $sb 'diffusion-model' $diffusionModel
+Emit-Setting $sb 'vae'             $vae
+Emit-Setting $sb 'llm'             $llm
+Emit-Setting $sb 't5xxl'           $t5xxl
+Emit-Setting $sb 'clip_l'          $clipL
+Emit-Setting $sb 'clip_g'          $clipG
+Emit-Setting $sb 'lora-model-dir'  $loraDir
+Emit-Setting $sb 'embd-dir'        $embdDir
+[void]$sb.AppendLine('')
+[void]$sb.AppendLine('; Memory / performance')
+Emit-Setting $sb 'type'            $weightType
+Emit-Bool    $sb 'offload-to-cpu'  $offload
+Emit-Bool    $sb 'mmap'            $mmap
+Emit-Bool    $sb 'fa'              $fa
+Emit-Bool    $sb 'diffusion-fa'    $diffFa
+Emit-Bool    $sb 'clip-on-cpu'     $clipOnCpu
+Emit-Bool    $sb 'vae-on-cpu'      $vaeOnCpu
+Emit-Bool    $sb 'vae-tiling'      $vaeTiling
+Emit-Setting $sb 'max-vram'        $maxVram '8.0'
+[void]$sb.AppendLine('')
+[void]$sb.AppendLine('; Default generation params (web UI can override per request)')
+Emit-Setting $sb 'sampler'         $sampler
+Emit-Setting $sb 'steps'           $steps
+Emit-Setting $sb 'cfg-scale'       $cfg
+Emit-Setting $sb 'guidance'        $guidance
+Emit-Setting $sb 'width'           $width
+Emit-Setting $sb 'height'          $height
+
+$newSection = $sb.ToString().TrimEnd("`r", "`n") + "`r`n"
+
+# 7) Section-preserving write: replace existing [modelId] section, or append
+#    a new one, leaving the rest of the file untouched.
+$existingText = if (Test-Path $presetsPath) { Get-Content -Path $presetsPath -Raw -Encoding UTF8 } else { '' }
+if (-not $existingText) { $existingText = '' }
+
+$escapedId = [regex]::Escape($modelId)
+$existingMatch = [regex]::Match($existingText, "(?m)^\[$escapedId\][\s\S]*?(?=^\[|\z)")
+if ($existingMatch.Success) {
+    $before = $existingText.Substring(0, $existingMatch.Index)
+    $after  = $existingText.Substring($existingMatch.Index + $existingMatch.Length)
+    # If another section follows, insert a blank-line separator before it.
+    $sep    = if ($after -ne '') { "`r`n" } else { '' }
+    $newText = $before + $newSection + $sep + $after
+} else {
+    if ($existingText.Length -gt 0) {
+        $existingText = $existingText.TrimEnd("`r", "`n") + "`r`n`r`n"
+    }
+    $newText = $existingText + $newSection
+}
+
+[System.IO.File]::WriteAllText($presetsPath, $newText, [System.Text.UTF8Encoding]::new($false))
+
+# 8) Update server.ini's ModelsDir pointer
+Set-ServerIniField -Path $serverPath -Key 'ModelsDir' -Value $modelsDir
+
+Write-Host ""
+if ($existingMatch.Success) {
+    Write-Host "Updated preset: $modelId" -ForegroundColor Green
+} else {
+    Write-Host "Added preset: $modelId" -ForegroundColor Green
+}
+Write-Host "  File: $presetsPath"
+Write-Host "  Edit it directly to tweak values, add exotic flags, or remove a preset."
+Write-Host "  run-server.ps1 will offer this preset in its model picker at launch."
+Write-Host ""
