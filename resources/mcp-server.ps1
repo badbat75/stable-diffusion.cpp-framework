@@ -384,6 +384,57 @@ function Invoke-EncodeFileBase64 {
     }
 }
 
+# ── Tool: get_model_info ─────────────────────────────────────────────
+# Curated view of sd-server's /sdcpp/v1/capabilities so the agent can
+# discover which model is loaded, what mode it runs in, which inputs it
+# accepts (ref_images / init_image / lora / hires), and what defaults
+# will be applied to fields the caller omits in generate_image.
+function Invoke-GetModelInfo {
+    $caps = Invoke-SdJson -Method GET -Path '/sdcpp/v1/capabilities'
+
+    # sd-server uses object-keyed "defaults" at top level for the current
+    # mode; nested sample_params holds sampler/steps/guidance.
+    $d  = $caps.defaults
+    $sp = if ($d) { $d.sample_params } else { $null }
+    $g  = if ($sp) { $sp.guidance } else { $null }
+
+    $info = [ordered]@{
+        model = [ordered]@{
+            name = $caps.model.name
+            stem = $caps.model.stem
+            path = $caps.model.path
+        }
+        current_mode    = $caps.current_mode
+        supported_modes = @($caps.supported_modes)
+        features        = $caps.features
+        defaults        = [ordered]@{
+            width           = $d.width
+            height          = $d.height
+            batch_count     = $d.batch_count
+            seed            = $d.seed
+            negative_prompt = $d.negative_prompt
+            clip_skip       = $d.clip_skip
+            sample_method   = if ($sp) { $sp.sample_method } else { $null }
+            sample_steps    = if ($sp) { $sp.sample_steps } else { $null }
+            scheduler       = if ($sp) { $sp.scheduler } else { $null }
+            txt_cfg         = if ($g)  { $g.txt_cfg } else { $null }
+            distilled_guidance = if ($g) { $g.distilled_guidance } else { $null }
+            output_format   = $d.output_format
+            strength        = $d.strength
+            auto_resize_ref_image = $d.auto_resize_ref_image
+        }
+        limits   = $caps.limits
+        samplers = @($caps.samplers)
+        schedulers = @($caps.schedulers)
+        output_formats = @($caps.output_formats)
+        loras    = @($caps.loras | ForEach-Object { $_.name })
+    }
+
+    Write-Log INFO ("get_model_info: model={0} mode={1}" -f $info.model.name, $info.current_mode)
+    $json = $info | ConvertTo-Json -Depth 10
+    return @{ content = @(@{ type = 'text'; text = $json }) }
+}
+
 # ── Tool registry ────────────────────────────────────────────────────
 $Tools = @(
     @{
@@ -431,6 +482,14 @@ $Tools = @(
                 max_bytes   = @{ type = 'integer'; default = 26214400; minimum = 1; description = 'Raw-file size cap. Files larger than this are rejected to keep model context affordable.' }
             }
         }
+    },
+    @{
+        name        = 'get_model_info'
+        description = 'Return a curated snapshot of the model currently loaded by sd-server: name/stem/path, current mode (img_gen / vid_gen), supported features (init_image, ref_images, lora, hires, ...), the defaults that will be applied to fields you omit in generate_image (sampler, steps, txt_cfg, distilled_guidance, width/height, ...), dimension limits, and the lists of supported samplers / schedulers / output_formats / loras. Call this before generate_image when you need to know which knobs are meaningful for the active model (e.g. Flux models ignore negative_prompt, only some accept ref_images).'
+        inputSchema = @{
+            type       = 'object'
+            properties = @{}
+        }
     }
 )
 
@@ -448,6 +507,7 @@ function Invoke-Tool {
     switch ($Name) {
         'generate_image'     { return Invoke-GenerateImage    -Arguments $Arguments -ProgressToken $ProgressToken }
         'encode_file_base64' { return Invoke-EncodeFileBase64 -Arguments $Arguments }
+        'get_model_info'     { return Invoke-GetModelInfo }
         default              { throw "unknown tool: $Name" }
     }
 }
