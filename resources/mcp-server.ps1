@@ -289,7 +289,8 @@ function Invoke-GenerateImage {
         [string]::IsNullOrWhiteSpace($savePath)
     }
 
-    $savedPaths = @()
+    $savedPaths   = @()
+    $savedSidecar = $null
     if (-not [string]::IsNullOrWhiteSpace($savePath)) {
         # Resolve relative paths against the MCP server's CWD (set by
         # run-server.ps1 to %LOCALAPPDATA%\stable-diffusion.cpp when launched
@@ -319,6 +320,70 @@ function Invoke-GenerateImage {
                 Write-Log INFO ("saved image {0}/{1} to {2} ({3} bytes)" -f ($i+1), $images.Count, $p, $bytes.Length)
             }
         }
+
+        # ── Params sidecar ───────────────────────────────────────────
+        # One JSON per request, named after $save_path's stem (no _NNN
+        # suffix even for a batch — describes the request, not a frame).
+        # Holds the flat MCP args so a caller can replay the exact call;
+        # init_image / ref_images are recorded as their *original* paths
+        # rather than the base64 payload we forwarded to sd-server, both
+        # to keep the file small and because the source files outlive
+        # the encoded copy. Seeds reported per-image by sd-server (when
+        # present) are captured in `seeds_used` so a batch with seed=-1
+        # is still reproducible one image at a time.
+        $sidecarPath = [System.IO.Path]::ChangeExtension($resolved, '.json')
+
+        $snapshot = [ordered]@{
+            timestamp = (Get-Date).ToString('o')
+            prompt    = $body.prompt
+        }
+        if ($body.ContainsKey('negative_prompt')) { $snapshot.negative_prompt = $body.negative_prompt }
+        $snapshot.width       = $body.width
+        $snapshot.height      = $body.height
+        $snapshot.batch_count = $body.batch_count
+        if ($body.ContainsKey('seed')) { $snapshot.seed = $body.seed }
+        if ($body.sample_params) {
+            $sp = $body.sample_params
+            if ($sp.sample_method) { $snapshot.sampler   = $sp.sample_method }
+            if ($sp.sample_steps)  { $snapshot.steps     = $sp.sample_steps }
+            if ($sp.scheduler)     { $snapshot.scheduler = $sp.scheduler }
+            if ($sp.guidance) {
+                if ($null -ne $sp.guidance.txt_cfg)            { $snapshot.cfg_scale = $sp.guidance.txt_cfg }
+                if ($null -ne $sp.guidance.distilled_guidance) { $snapshot.guidance  = $sp.guidance.distilled_guidance }
+            }
+        }
+        $snapshot.output_format = $body.output_format
+        if ($body.ContainsKey('output_compression')) { $snapshot.output_compression = $body.output_compression }
+        if ($Arguments.ContainsKey('init_image')) {
+            $orig = [string]$Arguments['init_image']
+            $snapshot.init_image = if (Test-Path -LiteralPath $orig -PathType Leaf) {
+                (Resolve-Path -LiteralPath $orig).Path
+            } else { '<inline base64 / data URL>' }
+        }
+        if ($Arguments.ContainsKey('ref_images') -and $Arguments['ref_images']) {
+            $snapshot.ref_images = @(
+                foreach ($r in @($Arguments['ref_images'])) {
+                    $rs = [string]$r
+                    if (Test-Path -LiteralPath $rs -PathType Leaf) {
+                        (Resolve-Path -LiteralPath $rs).Path
+                    } else { '<inline base64 / data URL>' }
+                }
+            )
+        }
+        if ($body.ContainsKey('strength'))              { $snapshot.strength              = $body.strength }
+        if ($body.ContainsKey('auto_resize_ref_image')) { $snapshot.auto_resize_ref_image = $body.auto_resize_ref_image }
+        $seedsUsed = @(foreach ($img in $images) { if ($null -ne $img.seed) { $img.seed } })
+        if ($seedsUsed.Count -gt 0) { $snapshot.seeds_used = $seedsUsed }
+        $snapshot.saved_images = $savedPaths
+
+        try {
+            $sidecarJson = $snapshot | ConvertTo-Json -Depth 6
+            [System.IO.File]::WriteAllText($sidecarPath, $sidecarJson, [System.Text.UTF8Encoding]::new($false))
+            $savedSidecar = $sidecarPath
+            Write-Log INFO ("saved params sidecar: {0}" -f $sidecarPath)
+        } catch {
+            Write-Log WARN ("failed to write params sidecar {0}: {1}" -f $sidecarPath, $_.Exception.Message)
+        }
     }
 
     # annotations hint to MCP clients that the image is meant for the user
@@ -344,11 +409,14 @@ function Invoke-GenerateImage {
     if ($savedPaths.Count -gt 0) {
         $summary += " Saved to: " + ($savedPaths -join '; ') + "."
     }
+    if ($savedSidecar) {
+        $summary += " Params sidecar: $savedSidecar."
+    }
     if (-not $returnInline) {
         $summary += " (Inline image omitted; pass return_inline=true to also embed.)"
     }
-    Write-Log INFO ("job {0} completed in {1}s — {2} image(s), inline={3}, saved={4}" -f
-        $jobId, $elapsed, $images.Count, $returnInline, $savedPaths.Count)
+    Write-Log INFO ("job {0} completed in {1}s — {2} image(s), inline={3}, saved={4}, sidecar={5}" -f
+        $jobId, $elapsed, $images.Count, $returnInline, $savedPaths.Count, [bool]$savedSidecar)
 
     return @{ content = @(@{ type = 'text'; text = $summary }) + $imageContents }
 }
@@ -762,7 +830,7 @@ $Tools = @(
                 }
                 strength             = @{ type = 'number';  minimum = 0; maximum = 1; description = 'Denoise strength for img2img (0 = keep init_image, 1 = ignore it). Only used when init_image is set. sd.cpp default is 0.75.' }
                 auto_resize_ref_image = @{ type = 'boolean'; description = 'If true, ref_images are resized to match output width/height. Defaults to the sd-server preset.' }
-                save_path            = @{ type = 'string';  description = 'Optional absolute path to also write the rendered image to disk. Parent directory is auto-created. If batch_count > 1, the filename stem is suffixed with _001, _002, ... before the extension. Extension is honoured as-is — match it to output_format (jpeg/png/webp) yourself. Relative paths resolve against the MCP server CWD, which is unpredictable — pass absolute paths.' }
+                save_path            = @{ type = 'string';  description = 'Optional absolute path to also write the rendered image to disk. Parent directory is auto-created. If batch_count > 1, the filename stem is suffixed with _001, _002, ... before the extension. Extension is honoured as-is — match it to output_format (jpeg/png/webp) yourself. Relative paths resolve against the MCP server CWD, which is unpredictable — pass absolute paths. A sidecar `<stem>.json` is written next to the image(s) containing the flat request params (prompt, dimensions, sampler/scheduler, steps, cfg_scale/guidance, seed, init_image/ref_images paths, per-image seeds reported by sd-server) so the call can be replayed later.' }
                 return_inline        = @{ type = 'boolean'; description = 'Whether to also embed the rendered image(s) as inline base64 MCP content. Default: true when save_path is not set (current behavior), false when save_path is set (avoids blowing up context for batches you only want on disk). Set true with save_path to get both.' }
             }
         }
