@@ -33,71 +33,8 @@ if (-not (Test-Path $serverPath)) {
 New-Item -ItemType Directory -Path $configDir -Force | Out-Null
 $serverCfg = Read-ServerIni -Path $serverPath
 
-# ── Prompt helpers (Enter = default; `-` = unset for optional fields) ──
-
-function Read-IntDefault {
-    param([string]$Prompt, $Default, [int]$Min = 0, [int]$Max = [int]::MaxValue, [switch]$AllowUnset)
-    while ($true) {
-        $shown = if ($null -eq $Default) { 'unset' } else { "$Default" }
-        $reply = Read-Host "$Prompt [$shown]"
-        if (-not $reply) { return $Default }
-        if ($AllowUnset -and $reply -eq '-') { return $null }
-        [int]$parsed = 0
-        if ([int]::TryParse($reply, [ref]$parsed) -and $parsed -ge $Min -and $parsed -le $Max) {
-            return $parsed
-        }
-        Write-Host "  Invalid value (expected $Min-$Max$(if ($AllowUnset) { ' or `-` to unset' }))." -ForegroundColor Yellow
-    }
-}
-
-function Read-FloatDefault {
-    param([string]$Prompt, $Default, [switch]$AllowUnset)
-    while ($true) {
-        $shown = if ($null -eq $Default) { 'unset' } else { "$Default" }
-        $reply = Read-Host "$Prompt [$shown]"
-        if (-not $reply) { return $Default }
-        if ($AllowUnset -and $reply -eq '-') { return $null }
-        [double]$parsed = 0
-        if ([double]::TryParse($reply, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
-            return $parsed
-        }
-        Write-Host "  Invalid number." -ForegroundColor Yellow
-    }
-}
-
-function Read-BoolDefault {
-    param([string]$Prompt, [bool]$Default)
-    while ($true) {
-        $shown = if ($Default) { 'Y/n' } else { 'y/N' }
-        $reply = Read-Host "$Prompt [$shown]"
-        if (-not $reply) { return $Default }
-        if ($reply -match '^[yY]') { return $true }
-        if ($reply -match '^[nN]') { return $false }
-        Write-Host "  Invalid (y/n)." -ForegroundColor Yellow
-    }
-}
-
-function Read-StringDefault {
-    param([string]$Prompt, $Default, [switch]$AllowUnset)
-    $shown = if (-not $Default) { 'unset' } else { $Default }
-    $reply = Read-Host "$Prompt [$shown]"
-    if (-not $reply) { return $Default }
-    if ($AllowUnset -and $reply -eq '-') { return $null }
-    return $reply
-}
-
-function Read-EnumDefault {
-    param([string]$Prompt, [string]$Default, [string[]]$Choices, [switch]$AllowUnset)
-    $list = $Choices -join '/'
-    while ($true) {
-        $shown = if ($null -eq $Default -or $Default -eq '') { 'unset' } else { $Default }
-        $reply = Read-Host "$Prompt ($list) [$shown]"
-        if (-not $reply) { return $Default }
-        if ($AllowUnset -and $reply -eq '-') { return $null }
-        if ($Choices -contains $reply) { return $reply }
-        Write-Host "  Invalid (one of: $list)." -ForegroundColor Yellow
-    }
-}
+# Prompt helpers (Read-*Default) and INI section parsing (Get-Presets) live
+# in common-functions.ps1; ConvertTo-*OrNull helpers below do too.
 
 # Stable filesystem-safe id per model: basename without extension, without
 # multi-shard suffix, with non-alphanumerics collapsed to underscores.
@@ -106,43 +43,6 @@ function Get-ModelId {
     $base = [System.IO.Path]::GetFileNameWithoutExtension($ModelPath)
     $base = $base -replace '-\d{5}-of-\d{5}$', ''
     return ($base -replace '[^a-zA-Z0-9._-]+', '_')
-}
-
-# ── INI section parsing ──────────────────────────────────────────────
-# Returns each section as { Id; Text } where Text is the verbatim slice from
-# `[id]` up to (but not including) the next section header. Used both to
-# detect which models are already configured (for the `*` marker) and to
-# pre-fill prompt defaults from the active section.
-
-function Get-IniSections {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { return @() }
-    $text = Get-Content -Path $Path -Raw -Encoding UTF8
-    if (-not $text) { return @() }
-    $sections = @()
-    foreach ($m in [regex]::Matches($text, '(?m)^\[(?<id>[^\]\r\n]+)\][\s\S]*?(?=^\[|\z)')) {
-        $sections += [pscustomobject]@{
-            Id     = $m.Groups['id'].Value.Trim()
-            Text   = $m.Value
-            Index  = $m.Index
-            Length = $m.Length
-        }
-    }
-    return $sections
-}
-
-function Get-IniSectionKeys {
-    param([pscustomobject]$Section)
-    $result = @{}
-    if (-not $Section) { return $result }
-    foreach ($line in ($Section.Text -split "(?:\r\n|\n)")) {
-        $t = $line.Trim()
-        if ($t -eq '' -or $t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[')) { continue }
-        if ($t -match '^([^=]+?)\s*=\s*(.*)$') {
-            $result[$Matches[1].Trim()] = $Matches[2].Trim()
-        }
-    }
-    return $result
 }
 
 Write-Host ""
@@ -178,7 +78,7 @@ if ($models.Count -eq 0) {
 #    Matching is by the file path stored in each section's `diffusion-model`
 #    or `model` key — not by section name — so user-renamed sections still
 #    light up the marker (and feed defaults into the wizard below).
-$sections = @(Get-IniSections -Path $presetsPath)
+$sections = @(Get-Presets -Path $presetsPath)
 
 function Get-NormalizedPath {
     param([string]$Path)
@@ -189,7 +89,7 @@ function Get-NormalizedPath {
 
 $sectionsByPath = @{}
 foreach ($s in $sections) {
-    $sk = Get-IniSectionKeys -Section $s
+    $sk = $s.Keys
     $p = if ($sk['diffusion-model']) { $sk['diffusion-model'] } elseif ($sk['model']) { $sk['model'] } else { $null }
     $np = Get-NormalizedPath $p
     if ($np -and -not $sectionsByPath.ContainsKey($np)) { $sectionsByPath[$np] = $s }
@@ -229,12 +129,7 @@ $existingSection = if ($sectionsByPath.ContainsKey($selectedPath)) {
 # Preserve a hand-renamed section name instead of overwriting it with the
 # filename-derived id.
 if ($existingSection) { $modelId = $existingSection.Id }
-$cur = Get-IniSectionKeys -Section $existingSection
-
-# Convert string defaults read from INI into typed values for the prompts.
-function ConvertTo-IntOrNull   { param($v) if ($v) { $p=0; if ([int]::TryParse($v, [ref]$p)) { return $p } } return $null }
-function ConvertTo-FloatOrNull { param($v) if ($v) { $p=[double]0; if ([double]::TryParse($v, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$p)) { return $p } } return $null }
-function ConvertTo-BoolOrNull  { param($v) if ($v -eq 'true') { $true } elseif ($v -eq 'false') { $false } else { $null } }
+$cur = if ($existingSection) { $existingSection.Keys } else { @{} }
 
 # Sub-model paths
 $curDiffusion = if ($cur.ContainsKey('diffusion-model')) { $cur['diffusion-model'] } else { $null }

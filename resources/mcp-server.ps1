@@ -7,11 +7,18 @@
 #
 # Reads sd-server's host/port from
 #   %LOCALAPPDATA%\stable-diffusion.cpp\config\server.ini
-# Requires sd-server to already be running (start it via run-server.ps1
-# or the "stable-diffusion.cpp" Start Menu shortcut).
+# Lifecycle (switch_preset / start) is driven through run-server.ps1, which
+# writes %LOCALAPPDATA%\stable-diffusion.cpp\run\sd-server.state — this script
+# reads that file to learn the live pid/host/port/preset.
 #
 # Tools exposed:
-#   generate_image  — txt2img via /sdcpp/v1/img_gen (native async endpoint)
+#   generate_image     — txt2img / img2img via /sdcpp/v1/img_gen
+#   encode_file_base64 — read a local file, return base64 (debug aid)
+#   get_model_info     — curated /sdcpp/v1/capabilities snapshot
+#   server_status      — is sd-server alive and ready to serve?
+#   list_presets       — enumerate presets.ini, mark the active one
+#   switch_preset      — stop + restart sd-server with a different preset
+#   stop_server        — Stop-Process the running sd-server (if any)
 #
 # Wire it into Claude Code via ~/.claude.json or a project .mcp.json:
 #   {
@@ -51,22 +58,41 @@ function Write-Log {
 }
 
 # ── sd-server endpoint ───────────────────────────────────────────────
+# Two layers of resolution:
+#   1. Preferred: run\sd-server.state, written by run-server.ps1 when it
+#      spawns sd-server. Authoritative — reflects the actual host/port the
+#      live process bound to, even if server.ini was edited afterwards.
+#   2. Fallback: server.ini, captured here at startup. Used when no state
+#      file is present (e.g. someone ran sd-server.exe by hand, bypassing
+#      run-server.ps1) or when the state file's pid is no longer alive.
+# Get-SdServerBaseUrl is called on every Invoke-SdJson so switch_preset
+# (and any port change) is picked up without restarting mcp-server.
 $srvRaw  = Read-ServerIni -Path $ServerIni
 $srvHost = if ($srvRaw['Hostname']) { $srvRaw['Hostname'] } else { 'localhost' }
 $srvPort = if ($srvRaw['Port'])     { [int]$srvRaw['Port'] } else { 1234 }
-# When sd-server binds to all interfaces we still talk to it on loopback.
 if ($srvHost -eq '0.0.0.0') { $srvHost = '127.0.0.1' }
-$baseUrl = "http://${srvHost}:${srvPort}"
-Write-Log INFO "sd-server endpoint: $baseUrl  (config: $ServerIni)"
+$baseUrlFallback = "http://${srvHost}:${srvPort}"
+Write-Log INFO "sd-server fallback endpoint: $baseUrlFallback  (config: $ServerIni)"
+
+function Get-SdServerBaseUrl {
+    $state = Read-SdServerState
+    if ($state -and $state.host -and $state.port -and $state.pid -and
+        (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+        $h = if ($state.host -eq '0.0.0.0') { '127.0.0.1' } else { [string]$state.host }
+        return "http://${h}:$($state.port)"
+    }
+    return $script:baseUrlFallback
+}
 
 # ── HTTP helper ──────────────────────────────────────────────────────
 function Invoke-SdJson {
-    param([string]$Method, [string]$Path, $Body)
-    $url    = $baseUrl + $Path
-    $params = @{
+    param([string]$Method, [string]$Path, $Body, [int]$TimeoutSec = -1)
+    $url     = (Get-SdServerBaseUrl) + $Path
+    $timeout = if ($TimeoutSec -gt 0) { $TimeoutSec } else { $RequestTimeoutSec }
+    $params  = @{
         Uri         = $url
         Method      = $Method
-        TimeoutSec  = $RequestTimeoutSec
+        TimeoutSec  = $timeout
         ErrorAction = 'Stop'
     }
     if ($null -ne $Body) {
@@ -435,6 +461,277 @@ function Invoke-GetModelInfo {
     return @{ content = @(@{ type = 'text'; text = $json }) }
 }
 
+# ── sd-server lifecycle helpers (shared by list/status/switch/stop) ──
+# These read run\sd-server.state and the presets.ini that run-server.ps1
+# writes / consumes. Liveness probes go through Invoke-SdJson, which
+# already resolves the URL from the state file each call.
+
+function Stop-SdServer {
+    param([int]$TimeoutSec = 30)
+    $statePath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\run\sd-server.state"
+    $state = Read-SdServerState -Path $statePath
+    if (-not $state -or -not $state.pid) { return $false }
+    if (-not (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+        Remove-Item $statePath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Write-Log INFO "stopping sd-server (pid $($state.pid), preset '$($state.preset)')"
+    try { Stop-Process -Id $state.pid -Force -ErrorAction Stop } catch {
+        Write-Log WARN "Stop-Process failed: $($_.Exception.Message)"
+    }
+    # run-server.ps1's finally block removes the state file on exit.
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Test-Path $statePath) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+    }
+    if (Test-Path $statePath) {
+        Write-Log WARN "state file persisted past stop deadline; removing manually"
+        Remove-Item $statePath -Force -ErrorAction SilentlyContinue
+    }
+    return $true
+}
+
+function Start-SdServer {
+    param(
+        [string]$PresetId,
+        [int]$TimeoutSec = 180,
+        $ProgressToken = $null,
+        [double]$ProgressOffset = 0,
+        # Forwarded to run-server.ps1's -ServerExe. switch_preset captures this
+        # from the outgoing state file so a dev-mode sd-server (binary in
+        # build\cmake-build\bin\) survives a preset switch — without it,
+        # run-server.ps1 falls back to $PSScriptRoot\bin\sd-server.exe which
+        # only exists in installed mode.
+        [string]$ServerExe = ''
+    )
+    $runServer = Join-Path $PSScriptRoot "run-server.ps1"
+    if (-not (Test-Path -LiteralPath $runServer)) {
+        throw "run-server.ps1 not found at $runServer"
+    }
+    $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if (-not $pwshCmd) { throw "pwsh.exe not found on PATH" }
+
+    $statePath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\run\sd-server.state"
+    # Start-Process -ArgumentList <array> does NOT quote elements that contain
+    # spaces, so passing "C:\Program Files\...\run-server.ps1" via -File would
+    # be split on the space and pwsh.exe would error with code 64. Build a
+    # single command-line string with paths quoted explicitly. PresetId is a
+    # validated INI section name; ServerExe is either inherited from the
+    # outgoing state file or empty — both safe to wrap in double quotes.
+    $argParts = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        ('-File "{0}"'    -f $runServer),
+        ('-Preset "{0}"'  -f $PresetId),
+        '-NonInteractive'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ServerExe)) {
+        $argParts += ('-ServerExe "{0}"' -f $ServerExe)
+    }
+    $argString = $argParts -join ' '
+    Write-Log INFO ("spawning run-server.ps1 detached: preset='{0}'{1}" -f
+        $PresetId,
+        $(if ($ServerExe) { " server_exe='$ServerExe'" } else { '' }))
+    $proc = Start-Process -FilePath $pwshCmd.Source -ArgumentList $argString `
+        -WindowStyle Hidden -PassThru
+
+    $started  = Get-Date
+    $deadline = $started.AddSeconds($TimeoutSec)
+    $lastTick = -1
+
+    while ($true) {
+        if ($proc.HasExited -and -not (Test-Path $statePath)) {
+            throw "run-server.ps1 exited (code $($proc.ExitCode)) before writing state file. Check logs\sd-server.log."
+        }
+        if (Test-Path $statePath) {
+            # Get-SdServerBaseUrl resolves to the state file's host/port the
+            # moment run-server.ps1 finishes writing it.
+            try {
+                $null = Invoke-SdJson -Method GET -Path '/sdcpp/v1/capabilities' -TimeoutSec 5
+                Write-Log INFO "sd-server ready (preset='$PresetId', $(Get-SdServerBaseUrl))"
+                return
+            } catch {}
+        }
+        if ((Get-Date) -gt $deadline) {
+            throw "sd-server did not become ready within ${TimeoutSec}s. Check logs\sd-server.log."
+        }
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        if ($null -ne $ProgressToken -and $elapsed -ne $lastTick) {
+            Send-RpcNotification 'notifications/progress' @{
+                progressToken = $ProgressToken
+                progress      = $ProgressOffset + $elapsed
+                message       = "loading model... ${elapsed}s elapsed"
+            }
+            $lastTick = $elapsed
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# ── Tool: server_status ──────────────────────────────────────────────
+function Invoke-ServerStatus {
+    $statePath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\run\sd-server.state"
+    $state = Read-SdServerState -Path $statePath
+    if (-not $state) {
+        $result = [ordered]@{ running = $false; reason = 'no state file (sd-server is not running)' }
+        return @{ content = @(@{ type = 'text'; text = ($result | ConvertTo-Json -Depth 5) }) }
+    }
+    if (-not $state.pid -or -not (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+        $result = [ordered]@{
+            running     = $false
+            reason      = "state file points at pid $($state.pid) which is no longer alive"
+            stale_state = $state
+        }
+        return @{ content = @(@{ type = 'text'; text = ($result | ConvertTo-Json -Depth 5) }) }
+    }
+
+    $ready   = $false
+    $httpErr = $null
+    try {
+        $null = Invoke-SdJson -Method GET -Path '/sdcpp/v1/capabilities' -TimeoutSec 5
+        $ready = $true
+    } catch {
+        $httpErr = $_.Exception.Message
+    }
+
+    $result = [ordered]@{
+        running    = $true
+        ready      = $ready
+        pid        = $state.pid
+        host       = $state.host
+        port       = $state.port
+        url        = Get-SdServerBaseUrl
+        preset     = $state.preset
+        server_exe = $state.server_exe
+        started_at = $state.started_at
+    }
+    if (-not $ready) { $result.http_error = $httpErr }
+    Write-Log INFO ("server_status: running=true ready={0} preset='{1}'" -f $ready, $state.preset)
+    return @{ content = @(@{ type = 'text'; text = ($result | ConvertTo-Json -Depth 5) }) }
+}
+
+# ── Tool: list_presets ───────────────────────────────────────────────
+function Invoke-ListPresets {
+    $presetsPath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config\presets.ini"
+    $presets = @(Get-Presets -Path $presetsPath)
+
+    $state = Read-SdServerState
+    $activeId = $null
+    if ($state -and $state.pid -and (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+        $activeId = [string]$state.preset
+    }
+
+    $list = @()
+    foreach ($p in $presets) {
+        $entry = [ordered]@{ id = $p.Id; active = ($p.Id -eq $activeId) }
+        # Surface the most useful preset keys; agent can re-run get_model_info
+        # on the active preset for full detail.
+        foreach ($k in 'model','diffusion-model','vae','llm','t5xxl','clip_l','clip_g',
+                       'sampler','scheduler','steps','width','height','cfg-scale','guidance',
+                       'type','max-vram') {
+            if ($p.Keys.ContainsKey($k)) { $entry[$k] = $p.Keys[$k] }
+        }
+        $list += $entry
+    }
+
+    $info = [ordered]@{
+        presets = $list
+        active  = $activeId
+        path    = $presetsPath
+    }
+    Write-Log INFO ("list_presets: {0} preset(s), active='{1}'" -f $list.Count, $activeId)
+    return @{ content = @(@{ type = 'text'; text = ($info | ConvertTo-Json -Depth 5) }) }
+}
+
+# ── Tool: stop_server ────────────────────────────────────────────────
+function Invoke-StopServer {
+    $state = Read-SdServerState
+    if (-not $state -or -not $state.pid -or -not (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+        Write-Log INFO "stop_server: nothing to stop"
+        return @{ content = @(@{ type = 'text'; text = 'sd-server is not running. No action taken.' }) }
+    }
+    $pidWas    = $state.pid
+    $presetWas = $state.preset
+    Stop-SdServer | Out-Null
+    $msg = "Stopped sd-server (pid $pidWas, preset '$presetWas')."
+    Write-Log INFO "stop_server: $msg"
+    return @{ content = @(@{ type = 'text'; text = $msg }) }
+}
+
+# ── Tool: switch_preset ──────────────────────────────────────────────
+# Stops the current sd-server (if any), spawns run-server.ps1 with the
+# requested preset detached (-WindowStyle Hidden -NonInteractive), and
+# waits for /sdcpp/v1/capabilities to respond. Model load is the slow
+# part — expect 10-30s for big diffusion models.
+function Invoke-SwitchPreset {
+    param([hashtable]$Arguments, $ProgressToken = $null)
+
+    if (-not $Arguments -or
+        -not $Arguments.ContainsKey('preset') -or
+        [string]::IsNullOrWhiteSpace([string]$Arguments['preset'])) {
+        throw "missing required argument: preset"
+    }
+    $presetId   = [string]$Arguments['preset']
+    $timeoutSec = if ($Arguments.ContainsKey('timeout_sec')) { [int]$Arguments['timeout_sec'] } else { 180 }
+
+    $presetsPath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config\presets.ini"
+    $presets = @(Get-Presets -Path $presetsPath)
+    $target  = $presets | Where-Object { $_.Id -eq $presetId } | Select-Object -First 1
+    if (-not $target) {
+        $known = ($presets | ForEach-Object { $_.Id }) -join ', '
+        throw "preset '$presetId' not found in $presetsPath. Known: $known"
+    }
+
+    $current = Read-SdServerState
+    if ($current -and $current.pid -and (Get-Process -Id $current.pid -ErrorAction SilentlyContinue) -and ([string]$current.preset -eq $presetId)) {
+        Write-Log INFO "switch_preset: '$presetId' already active (pid $($current.pid)); no-op"
+        return @{ content = @(@{ type = 'text'; text = "Preset '$presetId' is already loaded (pid $($current.pid)). No action taken." }) }
+    }
+
+    # Capture the outgoing instance's sd-server.exe path before Stop-SdServer
+    # tears the state file down. Inheriting it keeps a dev-mode build (binary
+    # under build\cmake-build\bin\) usable across a preset switch. State files
+    # written by pre-server_exe versions of run-server.ps1 lack the field —
+    # warn so the silent fall-through to run-server.ps1's default lookup is
+    # at least observable in the log.
+    $inheritedExe = ''
+    if ($current -and $current.pid -and (Get-Process -Id $current.pid -ErrorAction SilentlyContinue)) {
+        if ($current.server_exe) {
+            $inheritedExe = [string]$current.server_exe
+        } else {
+            Write-Log WARN "outgoing state file has no server_exe field; relying on run-server.ps1's default lookup"
+        }
+    }
+
+    $started = Get-Date
+    if ($null -ne $ProgressToken) {
+        Send-RpcNotification 'notifications/progress' @{
+            progressToken = $ProgressToken; progress = 0
+            message       = "stopping current sd-server..."
+        }
+    }
+    $stopped = Stop-SdServer
+
+    $offset = [int]((Get-Date) - $started).TotalSeconds
+    if ($null -ne $ProgressToken) {
+        Send-RpcNotification 'notifications/progress' @{
+            progressToken = $ProgressToken; progress = $offset
+            message       = "starting sd-server with preset '$presetId'..."
+        }
+    }
+    Start-SdServer -PresetId $presetId -TimeoutSec $timeoutSec `
+        -ProgressToken $ProgressToken -ProgressOffset $offset `
+        -ServerExe $inheritedExe
+
+    $elapsed = [int]((Get-Date) - $started).TotalSeconds
+    $msg = if ($stopped) {
+        "Switched preset to '$presetId' (stop+start took ${elapsed}s)."
+    } else {
+        "Started sd-server with preset '$presetId' (took ${elapsed}s)."
+    }
+    Write-Log INFO $msg
+    return @{ content = @(@{ type = 'text'; text = $msg }) }
+}
+
 # ── Tool registry ────────────────────────────────────────────────────
 $Tools = @(
     @{
@@ -490,6 +787,42 @@ $Tools = @(
             type       = 'object'
             properties = @{}
         }
+    },
+    @{
+        name        = 'server_status'
+        description = 'Report whether sd-server is currently running and ready. Reads the run/sd-server.state file written by run-server.ps1, then probes /sdcpp/v1/capabilities to verify the process is actually serving HTTP (a fresh process may still be loading the model). Returns running/ready flags plus pid, host, port, url, active preset, server_exe path, and started_at timestamp. Call this before generate_image when you''re not sure sd-server is up, or as a sanity check after switch_preset.'
+        inputSchema = @{
+            type       = 'object'
+            properties = @{}
+        }
+    },
+    @{
+        name        = 'list_presets'
+        description = 'List all configured model presets from presets.ini, with their key parameters (model paths, sampler, steps, dimensions, guidance, memory knobs). Marks which preset is currently loaded (active=true). Use this to discover what presets are available before calling switch_preset.'
+        inputSchema = @{
+            type       = 'object'
+            properties = @{}
+        }
+    },
+    @{
+        name        = 'switch_preset'
+        description = 'Stop the current sd-server and restart it with a different preset (or just start it, if nothing was running). The preset name must match an [section] in presets.ini — call list_presets first if unsure. This is a SLOW operation: model load takes 10-30 seconds for big diffusion models (Flux, SDXL), and the previous model is fully unloaded first since sd-server holds one model per process. Returns a no-op message if the requested preset is already active. Progress notifications are streamed when the client supplies a progressToken.'
+        inputSchema = @{
+            type     = 'object'
+            required = @('preset')
+            properties = @{
+                preset      = @{ type = 'string';  description = 'Preset id, matching a [section] header in presets.ini. Use list_presets to discover.' }
+                timeout_sec = @{ type = 'integer'; default = 180; minimum = 10; description = 'How long to wait for sd-server to come up and respond to /sdcpp/v1/capabilities. Bump for very large models or slow disks.' }
+            }
+        }
+    },
+    @{
+        name        = 'stop_server'
+        description = 'Stop the running sd-server (Stop-Process by pid from the state file). Returns a no-op message if nothing was running. Note: when the user originally launched sd-server via the "stable-diffusion.cpp" Start Menu shortcut, stopping it from here closes their foreground window — confirm intent before calling this if a human is using the web UI.'
+        inputSchema = @{
+            type       = 'object'
+            properties = @{}
+        }
     }
 )
 
@@ -508,6 +841,10 @@ function Invoke-Tool {
         'generate_image'     { return Invoke-GenerateImage    -Arguments $Arguments -ProgressToken $ProgressToken }
         'encode_file_base64' { return Invoke-EncodeFileBase64 -Arguments $Arguments }
         'get_model_info'     { return Invoke-GetModelInfo }
+        'server_status'      { return Invoke-ServerStatus }
+        'list_presets'       { return Invoke-ListPresets }
+        'switch_preset'      { return Invoke-SwitchPreset    -Arguments $Arguments -ProgressToken $ProgressToken }
+        'stop_server'        { return Invoke-StopServer }
         default              { throw "unknown tool: $Name" }
     }
 }

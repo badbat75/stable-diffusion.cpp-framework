@@ -20,15 +20,25 @@
 
 [CmdletBinding()]
 param(
-    [string]$ServerExe = (Join-Path $PSScriptRoot "bin\sd-server.exe"),
-    [string]$Preset
+    # Default resolves to HKLM:\Software\stable-diffusion.cpp\InstallDir\bin\
+    # sd-server.exe (registry key written by the NSIS installer), falling back
+    # to %ProgramFiles%\stable-diffusion.cpp\bin\sd-server.exe. Resolved lazily
+    # in the body so $ServerExe-was-explicitly-passed is detectable.
+    [string]$ServerExe,
+    [string]$Preset,
+    # Suppresses the "Press any key to close" prompts in the error trap and
+    # failed-exit branch. mcp-server.ps1 passes this when spawning detached
+    # (hidden window has no usable console for ReadKey).
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 trap {
     Write-Host "`n[X] ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "`nPress any key to close..." -ForegroundColor DarkYellow
-    $null = [System.Console]::ReadKey($true)
+    if (-not $NonInteractive) {
+        Write-Host "`nPress any key to close..." -ForegroundColor DarkYellow
+        $null = [System.Console]::ReadKey($true)
+    }
     break
 }
 
@@ -39,6 +49,22 @@ $installDir = $PSScriptRoot
 $configDir   = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config"
 $serverPath  = Join-Path $configDir "server.ini"
 $presetsPath = Join-Path $configDir "presets.ini"
+$runDir      = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\run"
+$statePath   = Join-Path $runDir "sd-server.state"
+
+# ── Single-instance guard ────────────────────────────────────────────
+# mcp-server.ps1 (or any other consumer) reads $statePath to discover the
+# running sd-server. Refuse to start if another instance is alive; silently
+# clean up if the file is stale (PID gone).
+New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+if (Test-Path $statePath) {
+    $existing = $null
+    try { $existing = Get-Content -Path $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $existing = $null }
+    if ($existing -and $existing.pid -and (Get-Process -Id $existing.pid -ErrorAction SilentlyContinue)) {
+        throw "sd-server is already running (pid $($existing.pid), preset '$($existing.preset)', http://$($existing.host):$($existing.port)). Stop it before starting another instance."
+    }
+    Remove-Item $statePath -Force -ErrorAction SilentlyContinue
+}
 
 # ── server.ini ───────────────────────────────────────────────────────
 if (-not (Test-Path $serverPath)) {
@@ -47,9 +73,7 @@ if (-not (Test-Path $serverPath)) {
 }
 $srvRaw = Read-ServerIni -Path $serverPath
 
-# Coerce strings → typed values.
-function ConvertTo-IntOrNull  { param($v) if ([string]::IsNullOrWhiteSpace("$v")) { return $null }; $p=0; if ([int]::TryParse("$v", [ref]$p)) { return $p } else { return $null } }
-
+# ConvertTo-IntOrNull lives in common-functions.ps1.
 $srv = @{
     Port      = ConvertTo-IntOrNull  $srvRaw['Port']
     Hostname  = $srvRaw['Hostname']
@@ -68,27 +92,7 @@ if (-not $hasPresets) {
     if (-not $hasPresets) { throw "No model presets configured. Aborting." }
 }
 
-# ── Parse presets ────────────────────────────────────────────────────
-function Get-Presets {
-    param([string]$Path)
-    $text = Get-Content -Path $Path -Raw -Encoding UTF8
-    $result = @()
-    foreach ($m in [regex]::Matches($text, '(?m)^\[(?<id>[^\]\r\n]+)\][\s\S]*?(?=^\[|\z)')) {
-        $keys = @{}
-        foreach ($line in ($m.Value -split "(?:\r\n|\n)")) {
-            $t = $line.Trim()
-            if ($t -eq '' -or $t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[')) { continue }
-            if ($t -match '^([^=]+?)\s*=\s*(.*)$') {
-                $val = $Matches[2].Trim()
-                if ($val -match '^(.*?)\s+[;#]\s.*$') { $val = $Matches[1].Trim() }
-                $keys[$Matches[1].Trim()] = $val
-            }
-        }
-        $result += [pscustomobject]@{ Id = $m.Groups['id'].Value.Trim(); Keys = $keys }
-    }
-    return $result
-}
-
+# ── Parse presets (Get-Presets lives in common-functions.ps1) ─────────
 $presets = @(Get-Presets -Path $presetsPath)
 
 # ── Pick the preset ──────────────────────────────────────────────────
@@ -117,7 +121,24 @@ if ($Preset) {
 }
 
 # ── Locate sd-server ────────────────────────────────────────────────
-if (-not (Test-Path $ServerExe)) {
+# Explicit -ServerExe is strict (caller intent). With no override, look up
+# the NSIS-installer's registry entry, then %ProgramFiles%, picking the
+# first candidate that actually exists.
+if (-not $PSBoundParameters.ContainsKey('ServerExe')) {
+    $candidates = @()
+    try {
+        $regInstall = (Get-ItemProperty -Path 'HKLM:\Software\stable-diffusion.cpp' -Name InstallDir -ErrorAction Stop).InstallDir
+        if ($regInstall) { $candidates += (Join-Path $regInstall 'bin\sd-server.exe') }
+    } catch {}
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles 'stable-diffusion.cpp\bin\sd-server.exe')
+    }
+    $ServerExe = ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    if (-not $ServerExe) {
+        throw "sd-server.exe not found. Tried: $($candidates -join '; ')."
+    }
+}
+if (-not (Test-Path -LiteralPath $ServerExe)) {
     throw "sd-server.exe not found at $ServerExe."
 }
 
@@ -251,15 +272,86 @@ Write-Host ""
 Write-Host "[*] Ctrl+C to stop" -ForegroundColor DarkYellow
 Write-Host ""
 
+# Use System.Diagnostics.Process (not the pipeline `& ... | Tee-Object`)
+# so we get sd-server.exe's actual PID for the state file — consumers
+# (mcp-server.ps1) can then Stop-Process directly without tree-kill.
+# Output is captured via OutputDataReceived / ErrorDataReceived events
+# and forwarded to both console and log; equivalent to the prior tee.
+$psi = [System.Diagnostics.ProcessStartInfo]::new()
+$psi.FileName = $ServerExe
+foreach ($a in $serverArgs) { [void]$psi.ArgumentList.Add([string]$a) }
+$psi.UseShellExecute        = $false
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError  = $true
+$psi.CreateNoWindow         = $false
+# Pin sd-server's CWD to the per-user data dir. Without this, sd-server
+# inherits whatever .NET Environment.CurrentDirectory was — which is NOT
+# affected by PowerShell's Set-Location and, when run-server.ps1 is itself
+# spawned via Start-Process -WindowStyle Hidden (mcp-server.ps1's
+# switch_preset path), defaults to C:\Windows\System32. sd-server's
+# refresh_lora_cache then recursively walks "." (the default
+# --lora-model-dir) and hits Access-Denied entries inside System32, which
+# bubbles up as HTTP 500 from /sdcpp/v1/capabilities AND /img_gen.
+$psi.WorkingDirectory       = $dataDir
+
+$proc = [System.Diagnostics.Process]::new()
+$proc.StartInfo = $psi
+
+# Event handlers fire on a background runspace where the PowerShell host
+# isn't available — use [Console] and [System.IO.File] directly. The log
+# file already exists (Out-File created it above) so AppendAllText won't
+# add a BOM and won't fight Tee-Object for ownership.
+$stdoutEvent = $null
+$stderrEvent = $null
+$stateWritten = $false
 $exitCode = 0
 try {
-    # Tee sd-server's stdout+stderr to both the console and the log so the
-    # user can see what's happening AND we keep a persistent record. `2>&1`
-    # merges stderr into stdout as plain strings (without this, $ErrorAction
-    # = 'Stop' would turn every stderr line into a terminating error).
-    & $ServerExe @serverArgs 2>&1 | Tee-Object -FilePath $logPath -Append
-    $exitCode = $LASTEXITCODE
+    $stdoutEvent = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $logPath -Action {
+        $line = $EventArgs.Data
+        if ($null -ne $line) {
+            [Console]::Out.WriteLine($line)
+            try { [System.IO.File]::AppendAllText($Event.MessageData, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8) } catch {}
+        }
+    }
+    $stderrEvent = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $logPath -Action {
+        $line = $EventArgs.Data
+        if ($null -ne $line) {
+            [Console]::Error.WriteLine($line)
+            try { [System.IO.File]::AppendAllText($Event.MessageData, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8) } catch {}
+        }
+    }
+
+    if (-not $proc.Start()) { throw "Failed to start sd-server.exe." }
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    # State file is the contract with mcp-server: pid + host/port for
+    # readiness probe + preset/server_exe for diagnostics.
+    $state = [ordered]@{
+        pid        = $proc.Id
+        host       = $hostname
+        port       = $port
+        preset     = $active.Id
+        server_exe = $ServerExe
+        started_at = (Get-Date).ToString('o')
+    }
+    ($state | ConvertTo-Json) | Set-Content -Path $statePath -Encoding UTF8
+    $stateWritten = $true
+
+    $proc.WaitForExit()
+    $exitCode = $proc.ExitCode
 } finally {
+    if ($stdoutEvent) {
+        Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
+        Remove-Job -Id $stdoutEvent.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($stderrEvent) {
+        Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
+        Remove-Job -Id $stderrEvent.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
+    if ($stateWritten) { Remove-Item $statePath -Force -ErrorAction SilentlyContinue }
+
     Write-Host ""
     if ($exitCode -eq 0) {
         Write-Host "[OK] Server stopped." -ForegroundColor Green
@@ -267,8 +359,10 @@ try {
         Write-Host "[X] sd-server exited with code $exitCode." -ForegroundColor Red
         Write-Host "    Last lines of $logPath" -ForegroundColor DarkGray
         Get-Content -Path $logPath -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-        Write-Host ""
-        Write-Host "Press any key to close..." -ForegroundColor DarkYellow
-        $null = [System.Console]::ReadKey($true)
+        if (-not $NonInteractive) {
+            Write-Host ""
+            Write-Host "Press any key to close..." -ForegroundColor DarkYellow
+            $null = [System.Console]::ReadKey($true)
+        }
     }
 }

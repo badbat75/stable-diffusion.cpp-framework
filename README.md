@@ -2,7 +2,7 @@
 
 > **Windows only** — all scripts are PowerShell (.ps1) and target Windows 10/11 exclusively.
 
-PowerShell scripts to build and run [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) on Windows with multi-GPU backend support (CUDA, Vulkan, ROCm/HIP) and NSIS installer packaging. The web UI built into `sd-server` is used as the frontend — no separate UI is bundled. Mirrors the sibling [llama.cpp-framework](https://github.com/) repo one-to-one (same script names, same INI layout, same install-time flow).
+PowerShell scripts to build and run [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) on Windows with multi-GPU backend support (CUDA, Vulkan, ROCm/HIP) and NSIS installer packaging. The web UI built into `sd-server` is used as the frontend — no separate UI is bundled. Mirrors the sibling `llama.cpp-framework` repo one-to-one (same script names, same INI layout, same install-time flow).
 
 ## Prerequisites
 
@@ -81,10 +81,12 @@ Runtime configs are written on first launch (or by the NSIS install-time page). 
 | `01-configure.ps1` | Detects environment, verifies tools, auto-probes GPU toolchains, writes `config-build.psd1`. Accepts `-StableDiffusionCppDir`. |
 | `02-build.ps1` | CMake configure (out-of-source into `build\cmake-build\`) + Ninja build. Auto-clones stable-diffusion.cpp `--recursive` into `build\stable-diffusion.cpp\` (ggml submodule). Throws if more than one GPU backend toggle is on. |
 | `03-package.ps1` | Stages from `build\cmake-build\bin\` into `build\staging\`, then runs NSIS to produce `dist\stable-diffusion-cpp-<version>-win64-setup.exe`. |
+| `04-update-installed-scripts.ps1` | Dev convenience: hash-compares each file in `resources\` against the installed copy under `%ProgramFiles%\stable-diffusion.cpp\` and copies changed ones over. Self-elevates for the write. Binaries (`sd-server.exe` + ggml DLLs) are **not** touched — re-run `02-build.ps1` + the installer for those. |
 | `common.ps1` | Shared bootstrap: loads `$cfg` from `config-build.psd1`, prepends ROCm `bin\` to PATH, exposes `Enable-VsDevShell` as a function. VS Dev Shell activation is **opt-in** — only build/package scripts call it, runtime scripts don't pay the startup cost. |
 | `resources\run-server.ps1` | Runtime entry point shipped with the installer. Reads `server.ini` + `presets.ini`, picks one preset (auto if only one, interactive picker otherwise; `-Preset <id>` skips the prompt), translates it into sd-server CLI args, and launches sd-server. The user interacts with sd-server's built-in web UI at `http://<host>:<port>/`. Accepts `-ServerExe` to override the sd-server binary location. |
 | `resources\config-server.ps1` / `config-model.ps1` | Interactive config writers for the user-scope INI files (`server.ini` / `presets.ini`). Each supports `-NonInteractive` so NSIS can call them at install time. `config-model.ps1` does section-preserving edits — hand-edits to other sections survive. |
-| `resources\common-functions.ps1` | Shared INI parser/writer for `server.ini` (`Read-ServerIni`, `Set-ServerIniField`). Dot-sourced by all three runtime scripts. |
+| `resources\mcp-server.ps1` | Model Context Protocol bridge (stdio, JSON-RPC 2.0) that lets MCP-aware agents (Claude Code, etc.) drive the running sd-server. Exposes seven tools: `generate_image`, `get_model_info`, `encode_file_base64`, `server_status`, `list_presets`, `switch_preset`, `stop_server`. See *MCP integration* below. |
+| `resources\common-functions.ps1` | Shared helpers dot-sourced by all four runtime scripts: INI parser/writer for `server.ini` (`Read-ServerIni`, `Set-ServerIniField`), preset enumerator for `presets.ini` (`Get-Presets`), state-file reader (`Read-SdServerState`), plus type-coercion (`ConvertTo-*OrNull`) and interactive prompt (`Read-*Default`) helpers used by the config writers. |
 
 ## Packaging
 
@@ -98,6 +100,15 @@ Runtime configs are written on first launch (or by the NSIS install-time page). 
 - Includes a full uninstaller in Add/Remove Programs. By default it preserves `%LOCALAPPDATA%\stable-diffusion.cpp\` (configs, logs) across uninstalls; the user can opt in to a full wipe.
 
 NSIS is installed automatically via winget if not already present.
+
+## MCP integration
+
+`resources\mcp-server.ps1` is a Model Context Protocol bridge (stdio JSON-RPC) that lets MCP-aware agents call into a running `sd-server`. It's wired up two ways:
+
+- **In-repo development** — `.mcp.json` at the repo root is auto-detected by Claude Code; it uses a relative path so it works on any clone location.
+- **Installed** — `config-server.ps1` materializes `resources\mcp-config.template.json` into `%LOCALAPPDATA%\stable-diffusion.cpp\config\mcp.json` on every run (substituting the install dir for `@SCRIPT_DIR@`). Point an MCP client at it with `claude --mcp-config "%LOCALAPPDATA%\stable-diffusion.cpp\config\mcp.json"` or merge the file's `mcpServers` entry into `~/.claude.json`.
+
+Either way, once `sd-server` is up the agent can call `generate_image`, `get_model_info`, `list_presets`, `switch_preset`, `server_status`, `stop_server`, and `encode_file_base64`. The bridge reads sd-server's pid / host / port from `%LOCALAPPDATA%\stable-diffusion.cpp\run\sd-server.state` (written by `run-server.ps1` while sd-server is alive), so a `switch_preset` mid-session is observed without restarting the bridge.
 
 ## GPU backend notes
 

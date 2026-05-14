@@ -52,25 +52,7 @@ if ($DumpIni) {
 
 New-Item -ItemType Directory -Path $configDir -Force | Out-Null
 
-# ── Helpers ──────────────────────────────────────────────────────────
-
-function Read-IntDefault {
-    param([string]$Prompt, $Default, [int]$Min = 0, [int]$Max = [int]::MaxValue, [switch]$AllowUnset)
-    while ($true) {
-        $shown = if ($null -eq $Default) { 'unset' } else { "$Default" }
-        $reply = Read-Host "$Prompt [$shown]"
-        if (-not $reply) { return $Default }
-        if ($AllowUnset -and $reply -eq '-') { return $null }
-        [int]$parsed = 0
-        if ([int]::TryParse($reply, [ref]$parsed) -and $parsed -ge $Min -and $parsed -le $Max) {
-            return $parsed
-        }
-        Write-Host "  Invalid value." -ForegroundColor Yellow
-    }
-}
-
-# Coerce string values from the INI / migration to typed defaults.
-function ConvertTo-IntOrNull { param($v) if ([string]::IsNullOrWhiteSpace("$v")) { return $null }; $p=0; if ([int]::TryParse("$v", [ref]$p)) { return $p } else { return $null } }
+# Read-IntDefault and ConvertTo-IntOrNull live in common-functions.ps1.
 
 # ── Resolve initial values ───────────────────────────────────────────
 
