@@ -1,9 +1,14 @@
-# Sync resources/ → installed stable-diffusion.cpp directory.
+# Sync resources/ + sd-config.exe → installed stable-diffusion.cpp directory.
 #
-# Dev convenience: lets you iterate on the runtime PowerShell scripts in this
-# repo and push them straight into the NSIS-installed copy under Program Files
-# without rebuilding / reinstalling. Binaries (sd-server.exe + ggml DLLs) are
-# NOT touched — re-run 02-build-server.ps1 + the installer for those.
+# Dev convenience: lets you iterate on the runtime PowerShell scripts and the
+# sd-config GUI/CLI in this repo and push them straight into the NSIS-installed
+# copy under Program Files without rebuilding the installer. sd-server.exe and
+# the ggml backend DLLs are NOT touched — re-run 02-build-server.ps1 + the
+# installer for those.
+#
+# sd-config.exe is taken as-is from sd-config\target\release\; if it's missing
+# you'll get a [MISS] line — run 03-build-gui.ps1 first (or 04-package.ps1
+# end-to-end).
 #
 # Resolves the target directory from HKLM\Software\stable-diffusion.cpp's
 # InstallDir (set by the NSIS installer), falling back to
@@ -50,29 +55,31 @@ if (-not $isAdmin) {
     exit $proc.ExitCode
 }
 
-# ── File list (mirrors 04-package.ps1 staging, minus the bin\ tree) ──
+# ── File list (mirrors 04-package.ps1 staging, minus the ggml DLLs) ──
+# Each entry is { Src = absolute source path; Dst = path relative to InstallDir }.
 $resources = Join-Path $PSScriptRoot 'resources'
-$files = @(
-    'run-server.ps1'
-    'common-functions.ps1'
-    'mcp-server.ps1'
-    'stable-diffusion.ico'
+$entries = @(
+    [pscustomobject]@{ Src = Join-Path $resources 'run-server.ps1';                       Dst = 'run-server.ps1'       }
+    [pscustomobject]@{ Src = Join-Path $resources 'common-functions.ps1';                 Dst = 'common-functions.ps1' }
+    [pscustomobject]@{ Src = Join-Path $resources 'mcp-server.ps1';                       Dst = 'mcp-server.ps1'       }
+    [pscustomobject]@{ Src = Join-Path $resources 'stable-diffusion.ico';                 Dst = 'stable-diffusion.ico' }
+    [pscustomobject]@{ Src = Join-Path $PSScriptRoot 'sd-config\target\release\sd-config.exe'; Dst = 'bin\sd-config.exe' }
 )
 
 Write-Host ""
-Write-Host "Source: $resources"   -ForegroundColor Cyan
 Write-Host "Target: $InstallDir"  -ForegroundColor Cyan
 Write-Host ""
 
 $updated = 0
 $skipped = 0
 $missing = 0
-foreach ($name in $files) {
-    $src = Join-Path $resources $name
-    $dst = Join-Path $InstallDir $name
+foreach ($entry in $entries) {
+    $src = $entry.Src
+    $dst = Join-Path $InstallDir $entry.Dst
+    $label = $entry.Dst
 
     if (-not (Test-Path -LiteralPath $src)) {
-        Write-Host ("  [MISS] {0}  (no source file)" -f $name) -ForegroundColor Red
+        Write-Host ("  [MISS] {0}  (no source file at {1})" -f $label, $src) -ForegroundColor Red
         $missing++
         continue
     }
@@ -85,13 +92,19 @@ foreach ($name in $files) {
     }
 
     if (-not $needsCopy) {
-        Write-Host ("  [ ok ] {0}" -f $name) -ForegroundColor DarkGray
+        Write-Host ("  [ ok ] {0}" -f $label) -ForegroundColor DarkGray
         $skipped++
         continue
     }
 
+    # Ensure parent directory exists (e.g. bin\ for sd-config.exe).
+    $dstParent = Split-Path -Parent $dst
+    if (-not (Test-Path -LiteralPath $dstParent)) {
+        New-Item -ItemType Directory -Path $dstParent -Force | Out-Null
+    }
+
     Copy-Item -LiteralPath $src -Destination $dst -Force
-    Write-Host ("  [COPY] {0}" -f $name) -ForegroundColor Green
+    Write-Host ("  [COPY] {0}" -f $label) -ForegroundColor Green
     $updated++
 }
 
