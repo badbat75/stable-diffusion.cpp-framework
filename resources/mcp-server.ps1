@@ -335,8 +335,12 @@ function Invoke-GenerateImage {
 
         $snapshot = [ordered]@{
             timestamp = (Get-Date).ToString('o')
-            prompt    = $body.prompt
         }
+        $stateForSidecar = Read-SdServerState
+        if ($stateForSidecar -and $stateForSidecar.preset) {
+            $snapshot.preset = [string]$stateForSidecar.preset
+        }
+        $snapshot.prompt = $body.prompt
         if ($body.ContainsKey('negative_prompt')) { $snapshot.negative_prompt = $body.negative_prompt }
         $snapshot.width       = $body.width
         $snapshot.height      = $body.height

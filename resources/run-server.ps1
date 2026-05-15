@@ -297,33 +297,51 @@ $psi.WorkingDirectory       = $dataDir
 $proc = [System.Diagnostics.Process]::new()
 $proc.StartInfo = $psi
 
-# Event handlers fire on a background runspace where the PowerShell host
-# isn't available — use [Console] and [System.IO.File] directly. The log
-# file already exists (Out-File created it above) so AppendAllText won't
-# add a BOM and won't fight Tee-Object for ownership.
-$stdoutEvent = $null
-$stderrEvent = $null
+# sd-server's progress bar prints with \r between updates and only emits \n
+# at completion, so the line-buffered OutputDataReceived/BeginOutputReadLine
+# path hides all interim progress until the final newline. Forward raw chunks
+# from the underlying TextReader instead, on a real .NET thread (a PowerShell
+# runspace can't service Task.Run without session state). Bytes hit the
+# console and the log as soon as sd-server flushes its CRT buffer.
+if (-not ('SdLogPipe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+
+public static class SdLogPipe {
+    private static readonly object _fileLock = new object();
+
+    public static Task Forward(TextReader reader, string logPath, bool toStderr) {
+        return Task.Run(() => {
+            char[] buf = new char[4096];
+            int n;
+            try {
+                while ((n = reader.Read(buf, 0, buf.Length)) > 0) {
+                    string s = new string(buf, 0, n);
+                    if (toStderr) { Console.Error.Write(s); } else { Console.Out.Write(s); }
+                    try {
+                        lock (_fileLock) {
+                            File.AppendAllText(logPath, s, Encoding.UTF8);
+                        }
+                    } catch { }
+                }
+            } catch { }
+        });
+    }
+}
+'@
+}
+
+$outTask = $null
+$errTask = $null
 $stateWritten = $false
 $exitCode = 0
 try {
-    $stdoutEvent = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $logPath -Action {
-        $line = $EventArgs.Data
-        if ($null -ne $line) {
-            [Console]::Out.WriteLine($line)
-            try { [System.IO.File]::AppendAllText($Event.MessageData, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8) } catch {}
-        }
-    }
-    $stderrEvent = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $logPath -Action {
-        $line = $EventArgs.Data
-        if ($null -ne $line) {
-            [Console]::Error.WriteLine($line)
-            try { [System.IO.File]::AppendAllText($Event.MessageData, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8) } catch {}
-        }
-    }
-
     if (-not $proc.Start()) { throw "Failed to start sd-server.exe." }
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
+    $outTask = [SdLogPipe]::Forward($proc.StandardOutput, $logPath, $false)
+    $errTask = [SdLogPipe]::Forward($proc.StandardError,  $logPath, $true)
 
     # State file is the contract with mcp-server: pid + host/port for
     # readiness probe + preset/server_exe for diagnostics.
@@ -341,14 +359,10 @@ try {
     $proc.WaitForExit()
     $exitCode = $proc.ExitCode
 } finally {
-    if ($stdoutEvent) {
-        Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
-        Remove-Job -Id $stdoutEvent.Id -Force -ErrorAction SilentlyContinue
-    }
-    if ($stderrEvent) {
-        Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
-        Remove-Job -Id $stderrEvent.Id -Force -ErrorAction SilentlyContinue
-    }
+    # Give the forwarder tasks a moment to drain any trailing buffered
+    # bytes after sd-server exits before we fall through to cleanup.
+    $drain = @($outTask, $errTask | Where-Object { $_ })
+    if ($drain.Count -gt 0) { try { [System.Threading.Tasks.Task]::WaitAll($drain, 5000) | Out-Null } catch {} }
     if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
     if ($stateWritten) { Remove-Item $statePath -Force -ErrorAction SilentlyContinue }
 

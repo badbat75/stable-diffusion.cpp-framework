@@ -131,8 +131,22 @@ $existingSection = if ($sectionsByPath.ContainsKey($selectedPath)) {
 if ($existingSection) { $modelId = $existingSection.Id }
 $cur = if ($existingSection) { $existingSection.Keys } else { @{} }
 
-# Sub-model paths
+# Model type drives whether the picked file is written to `model` (-m, full
+# all-in-one bundle) or `diffusion-model` (--diffusion-model, standalone UNet
+# needing external VAE / text encoder). sd-server requires exactly one of the
+# two — populating both was the source of confusion in earlier presets.
+#
+# Default: if the existing section already has a non-empty `diffusion-model`,
+# stay in standalone mode; otherwise default to standalone for new presets
+# (matches Flux / Flux2 / SD3 / Wan / Qwen-Image, the common modern case).
 $curDiffusion = if ($cur.ContainsKey('diffusion-model')) { $cur['diffusion-model'] } else { $null }
+$curModel     = if ($cur.ContainsKey('model'))           { $cur['model'] }           else { $null }
+$modelTypeDefault =
+    if ($curDiffusion) { 'standalone' }
+    elseif ($curModel) { 'allinone' }
+    else { 'standalone' }
+
+# Sub-model paths
 $curVae       = if ($cur.ContainsKey('vae'))             { $cur['vae'] }             else { $null }
 $curLlm       = if ($cur.ContainsKey('llm'))             { $cur['llm'] }             else { $null }
 $curT5xxl     = if ($cur.ContainsKey('t5xxl'))           { $cur['t5xxl'] }           else { $null }
@@ -165,17 +179,29 @@ Write-Host "Preset id: $modelId" -ForegroundColor Green
 Write-Host "Press Enter to accept the default; type '-' to unset an optional field." -ForegroundColor DarkGray
 Write-Host ""
 
-Write-Host "── Sub-model paths ──" -ForegroundColor Cyan
-Write-Host "  Required when using --diffusion-model (not -m). The required set depends on" -ForegroundColor DarkGray
-Write-Host "  the model architecture:" -ForegroundColor DarkGray
-Write-Host "    *  --vae      SD3, Flux, Flux2, Wan, Qwen-Image" -ForegroundColor DarkGray
-Write-Host "    *  --llm      Flux2 (mistral-small-3.2), Qwen-Image (qwen2.5vl), Z-Image (qwen3)" -ForegroundColor DarkGray
-Write-Host "    *  --t5xxl    SD3, Flux, Wan, Chroma" -ForegroundColor DarkGray
-Write-Host "    *  --clip_l   SD3, Flux" -ForegroundColor DarkGray
-Write-Host "    *  --clip_g   SD3" -ForegroundColor DarkGray
-Write-Host "  If -m points at an all-in-one bundle (typical for SD1.x/SDXL), leave these unset." -ForegroundColor DarkGray
+Write-Host "── Model type ──" -ForegroundColor Cyan
+Write-Host "  [allinone]    SD 1.x / SDXL single-file .safetensors with UNet + VAE + text" -ForegroundColor DarkGray
+Write-Host "                encoder bundled together. Maps to sd-server's -m / --model." -ForegroundColor DarkGray
+Write-Host "  [standalone]  Flux / Flux2 / SD3 / Wan / Qwen-Image / Chroma — diffusion-only" -ForegroundColor DarkGray
+Write-Host "                weights that need an external VAE + text encoder. Maps to" -ForegroundColor DarkGray
+Write-Host "                sd-server's --diffusion-model." -ForegroundColor DarkGray
 Write-Host ""
-$diffusionModel = Read-StringDefault "   Standalone diffusion model (--diffusion-model)" $curDiffusion -AllowUnset
+$modelType = Read-EnumDefault "Model type" $modelTypeDefault @('allinone','standalone')
+
+Write-Host ""
+Write-Host "── Sub-model paths ──" -ForegroundColor Cyan
+if ($modelType -eq 'standalone') {
+    Write-Host "  Required set depends on the diffusion architecture:" -ForegroundColor DarkGray
+    Write-Host "    *  --vae      SD3, Flux, Flux2, Wan, Qwen-Image" -ForegroundColor DarkGray
+    Write-Host "    *  --llm      Flux2 (mistral-small-3.2), Qwen-Image (qwen2.5vl), Z-Image (qwen3)" -ForegroundColor DarkGray
+    Write-Host "    *  --t5xxl    SD3, Flux, Wan, Chroma" -ForegroundColor DarkGray
+    Write-Host "    *  --clip_l   SD3, Flux" -ForegroundColor DarkGray
+    Write-Host "    *  --clip_g   SD3" -ForegroundColor DarkGray
+} else {
+    Write-Host "  All-in-one bundles normally embed their VAE / text encoder — leave these unset." -ForegroundColor DarkGray
+    Write-Host "  Override only if you're swapping in a separate VAE or text encoder file." -ForegroundColor DarkGray
+}
+Write-Host ""
 $vae            = Read-StringDefault " * VAE (--vae)"                                    $curVae       -AllowUnset
 $llm            = Read-StringDefault " * LLM text encoder (--llm)"                       $curLlm       -AllowUnset
 $t5xxl          = Read-StringDefault " * T5-XXL text encoder (--t5xxl)"                  $curT5xxl     -AllowUnset
@@ -188,7 +214,7 @@ Write-Host ""
 Write-Host "── Memory / performance ──" -ForegroundColor Cyan
 $weightType = Read-EnumDefault "Weight type (--type)" $(if ($curWeightType) { $curWeightType } else { '' }) @('f32','f16','q8_0','q5_1','q5_0','q4_1','q4_0','q2_K','q3_K','q4_K') -AllowUnset
 $offload    = Read-BoolDefault "Offload weights to CPU (--offload-to-cpu)" $(if ($null -ne $curOffload) { $curOffload } else { $false })
-$mmap       = Read-BoolDefault "Memory-map weights (--mmap)" $(if ($null -ne $curMmap) { $curMmap } else { $false })
+$mmap       = Read-BoolDefault "Memory-map weights (--mmap)" $(if ($null -ne $curMmap) { $curMmap } else { $true })
 $fa         = Read-BoolDefault "Flash Attention everywhere (--fa)" $(if ($null -ne $curFa) { $curFa } else { $false })
 $diffFa     = Read-BoolDefault "Flash Attention in diffusion only (--diffusion-fa)" $(if ($null -ne $curDiffFa) { $curDiffFa } else { $true })
 $clipOnCpu  = Read-BoolDefault "Keep CLIP on CPU (--clip-on-cpu)" $(if ($null -ne $curClipOnCpu) { $curClipOnCpu } else { $false })
@@ -230,12 +256,18 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine('; in this file are preserved. To add exotic sd-server flags, edit by hand and')
 [void]$sb.AppendLine('; do not re-run the wizard for this preset.')
 [void]$sb.AppendLine('')
-[void]$sb.AppendLine('; Primary model file (-m). Use diffusion-model below if you have a standalone')
-[void]$sb.AppendLine('; UNet that needs an external VAE / text encoder.')
-[void]$sb.AppendLine("model = $($selected.FullName)")
+if ($modelType -eq 'allinone') {
+    [void]$sb.AppendLine('; All-in-one model bundle (-m). SD 1.x / SDXL single-file checkpoint with')
+    [void]$sb.AppendLine('; UNet + VAE + text encoder bundled together. Sub-model paths below are')
+    [void]$sb.AppendLine('; normally unused for this type.')
+    [void]$sb.AppendLine("model = $($selected.FullName)")
+} else {
+    [void]$sb.AppendLine('; Standalone diffusion model (--diffusion-model). Requires an external')
+    [void]$sb.AppendLine('; VAE and the architecture-specific text encoder(s) below.')
+    [void]$sb.AppendLine("diffusion-model = $($selected.FullName)")
+}
 [void]$sb.AppendLine('')
 [void]$sb.AppendLine('; Sub-model paths')
-Emit-Setting $sb 'diffusion-model' $diffusionModel
 Emit-Setting $sb 'vae'             $vae
 Emit-Setting $sb 'llm'             $llm
 Emit-Setting $sb 't5xxl'           $t5xxl
