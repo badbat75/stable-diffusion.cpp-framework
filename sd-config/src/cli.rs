@@ -44,7 +44,7 @@ pub enum ServerCmd {
 pub struct ServerSet {
     #[arg(long)]
     pub port: Option<i32>,
-    #[arg(long, value_parser = ["localhost", "0.0.0.0"])]
+    #[arg(long)]
     pub hostname: Option<String>,
     /// Thread count for sd-server (`-t`). Pass 0 to unset.
     #[arg(long)]
@@ -196,8 +196,11 @@ fn run_mcp(c: McpCmd) -> Result<()> {
 
 fn expand_client_arg(arg: &str) -> Vec<mcp::ClientId> {
     if arg == "all" {
-        mcp::ClientId::all().into_iter().collect()
+        mcp::ClientId::all().to_vec()
     } else {
-        mcp::ClientId::from_str(arg).into_iter().collect()
+        match mcp::ClientId::from_str(arg) {
+            Some(id) => vec![id],
+            None => vec![],
+        }
     }
 }

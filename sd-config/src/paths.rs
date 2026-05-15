@@ -12,7 +12,7 @@ fn env_path(var: &str) -> Option<PathBuf> {
 /// `%LOCALAPPDATA%\stable-diffusion.cpp`
 pub fn data_root() -> PathBuf {
     env_path("LOCALAPPDATA")
-        .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .expect("LOCALAPPDATA not set on Windows")
         .join("stable-diffusion.cpp")
 }
 
@@ -28,7 +28,9 @@ pub fn presets_ini() -> PathBuf {
     config_dir().join("presets.ini")
 }
 
-#[allow(dead_code)] // reserved for future liveness checks against run-server.ps1
+/// `%LOCALAPPDATA%\stable-diffusion.cpp\run\sd-server.state` — the JSON
+/// `run-server.ps1` writes while sd-server is running. Consumed by the GUI's
+/// status-pill refresh and by `mcp-server.ps1` for liveness detection.
 pub fn run_state() -> PathBuf {
     data_root().join("run").join("sd-server.state")
 }
@@ -36,7 +38,7 @@ pub fn run_state() -> PathBuf {
 /// `%APPDATA%\Claude\claude_desktop_config.json`
 pub fn claude_desktop_config() -> PathBuf {
     env_path("APPDATA")
-        .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .expect("APPDATA not set on Windows")
         .join("Claude")
         .join("claude_desktop_config.json")
 }
@@ -44,7 +46,7 @@ pub fn claude_desktop_config() -> PathBuf {
 /// `%USERPROFILE%\.claude.json`
 pub fn claude_code_user_config() -> PathBuf {
     env_path("USERPROFILE")
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .expect("USERPROFILE not set on Windows")
         .join(".claude.json")
 }
 
@@ -54,10 +56,42 @@ pub fn claude_code_user_config() -> PathBuf {
 /// user-scope file here since that's what configures the editor globally.
 pub fn opencode_user_config() -> PathBuf {
     env_path("USERPROFILE")
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .expect("USERPROFILE not set on Windows")
         .join(".config")
         .join("opencode")
         .join("opencode.json")
+}
+
+/// Where sd-server.exe lives. Tries (in order):
+/// 1. `<exe-dir>\sd-server.exe`                                — installer layout (`$INSTDIR\bin\sd-config.exe` next to `sd-server.exe`)
+/// 2. `<exe-dir>\..\..\..\build\cmake-build\bin\sd-server.exe` — dev layout (sd-config\target\release\)
+/// 3. `<exe-dir>\..\build\cmake-build\bin\sd-server.exe`       — alt dev layout (sd-config\target\)
+pub fn sd_server_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let candidates = [
+        exe_dir.join("sd-server.exe"),
+        exe_dir
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("build")
+            .join("cmake-build")
+            .join("bin")
+            .join("sd-server.exe"),
+        exe_dir
+            .join("..")
+            .join("build")
+            .join("cmake-build")
+            .join("bin")
+            .join("sd-server.exe"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return c.canonicalize().ok().or_else(|| Some(c.clone()));
+        }
+    }
+    None
 }
 
 /// Where mcp-server.ps1 lives. Tries (in order):

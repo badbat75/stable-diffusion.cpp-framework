@@ -20,6 +20,10 @@ pub struct BindOption {
 
 /// The fixed entries at the top of the list, plus every usable IPv4 interface.
 pub fn list_options() -> Vec<BindOption> {
+    // NOTE: gui.rs::populate_bind_options inserts a synthetic "no longer
+    // present" row at index 2 (right after these two fixed entries) when
+    // the saved hostname isn't present in the live interface list. Keep
+    // these two entries first or update both files together.
     let mut out = vec![
         BindOption {
             label: "localhost (only this machine)".into(),

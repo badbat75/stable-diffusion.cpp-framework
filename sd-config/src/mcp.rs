@@ -97,6 +97,9 @@ fn check_installed(path: &Path, id: ClientId) -> Result<bool> {
     if txt.trim().is_empty() {
         return Ok(false);
     }
+    // Note: serde_json's `preserve_order` feature (Cargo.toml) is load-bearing —
+    // it's what keeps user-defined keys in their original order when we
+    // re-serialize after inserting our own entry. Don't drop the feature flag.
     let v: Value = serde_json::from_str(&txt).context("parse JSON")?;
     let bucket_key = bucket_key(id);
     let installed = v
@@ -172,7 +175,8 @@ pub fn install(id: ClientId) -> Result<()> {
         .insert(SERVER_KEY.to_string(), entry_value(id, &script));
 
     let serialized = serde_json::to_string_pretty(&v)?;
-    fs::write(&path, serialized + "\n").with_context(|| format!("write {}", path.display()))?;
+    atomic_write(&path, &(serialized + "\n"))
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -191,7 +195,8 @@ pub fn uninstall(id: ClientId) -> Result<()> {
         b.remove(SERVER_KEY);
     }
     let serialized = serde_json::to_string_pretty(&v)?;
-    fs::write(&path, serialized + "\n").with_context(|| format!("write {}", path.display()))?;
+    atomic_write(&path, &(serialized + "\n"))
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -219,7 +224,24 @@ pub fn install_at(id: ClientId, path: &Path) -> Result<()> {
         .or_insert_with(|| Value::Object(Default::default()));
     let b_obj = b.as_object_mut().context("bucket not object")?;
     b_obj.insert(SERVER_KEY.to_string(), entry_value(id, &script));
-    fs::write(path, serde_json::to_string_pretty(&v)? + "\n")?;
+    let serialized = serde_json::to_string_pretty(&v)?;
+    atomic_write(path, &(serialized + "\n"))
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Write JSON to disk via a temp-file + rename so a mid-write crash can't
+/// truncate the user's existing config. Both files must be on the same
+/// volume (always true for `<path>.tmp` next to `<path>`).
+fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension(
+        path.extension()
+            .map(|e| format!("{}.tmp", e.to_string_lossy()))
+            .unwrap_or_else(|| "tmp".to_string()),
+    );
+    fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

@@ -1,7 +1,15 @@
 // stable-diffusion.cpp configurator — Slint UI.
 //
-// Three tabs (Server / Models / MCP) backed by the same INI/JSON files the
-// PowerShell scripts write (server.ini, presets.ini, ~/.claude.json, etc.).
+// Windows-11-Settings-style chrome: top header strip (app icon + name + live
+// sd-server status pill) over a left navigation rail (Server / Models / MCP)
+// and a content area that swaps pages via `current_tab`. Sections inside each
+// page are rounded "cards" rather than stock GroupBoxes so the result reads
+// like a modern WinUI app rather than a bare widget dump.
+//
+// All persistence still flows through the same Rust modules the CLI uses
+// (server_cfg / presets / mcp). The visual restructure intentionally kept
+// every property name and callback signature so gui.rs needed no rewiring
+// beyond the new status-pill bindings.
 //
 // Slint can't bind a `let` in a callback body, so file-picker callbacks take
 // the current value and return the new value (= the dialog result, or the
@@ -9,8 +17,7 @@
 // typed as `string` to allow blank/unset.
 
 import {
-    TabWidget, VerticalBox, HorizontalBox, GroupBox, GridBox,
-    Button, LineEdit, ComboBox, CheckBox, ListView, ScrollView, Palette
+    LineEdit, ComboBox, CheckBox, Button, ListView, ScrollView, Palette
 } from "std-widgets.slint";
 
 export struct McpClient {
@@ -57,15 +64,149 @@ export struct PresetForm {
     height: int,
 }
 
-component LabeledField inherits HorizontalBox {
+// ── Reusable visual pieces ───────────────────────────────────────────────
+
+// A row in the left nav rail. WinUI 3 signature: subtle accent fill +
+// vertical accent bar on the leading edge when selected; faint hover
+// elsewhere. Glyphs use Segoe Fluent Icons (PUA codepoints) which is the
+// Windows 11 system icon font — falls back to MDL2 Assets glyphs at the
+// same codepoints on older Windows.
+component NavItem inherits Rectangle {
     in property <string> label;
-    in property <length> label_width: 130px;
+    in property <string> glyph;
+    in property <bool> selected;
+    callback clicked;
+
+    height: 40px;
+    border-radius: 6px;
+    background: selected
+        ? Palette.accent-background.transparentize(0.82)
+        : (touch.has-hover ? Palette.alternate-background : transparent);
+
+    // Vertical accent bar on the leading edge — the bit your eye locks onto.
+    if selected : Rectangle {
+        x: 0; y: 8px; width: 3px; height: parent.height - 16px;
+        border-radius: 1.5px;
+        background: Palette.accent-background;
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 12px;
+        spacing: 12px;
+        alignment: start;
+
+        Text {
+            text: root.glyph;
+            font-family: "Segoe Fluent Icons";
+            font-size: 16px;
+            color: root.selected ? Palette.accent-background : Palette.foreground;
+            vertical-alignment: center;
+            width: 22px;
+        }
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: root.selected ? 600 : 400;
+            color: Palette.foreground;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// The header status pill. Green when sd-server is alive, neutral otherwise.
+// Click to force-refresh the underlying state-file probe.
+component StatusPill inherits Rectangle {
+    in property <bool> running;
+    in property <string> text;
+    callback clicked;
+
+    height: 28px;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: root.running ? #2e7d32 : Palette.border;
+    background: root.running
+        ? #2e7d32.transparentize(0.88)
+        : Palette.alternate-background;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 14px;
+        spacing: 8px;
+        alignment: start;
+
+        // Status dot. Wrap in a column so we get true vertical centering
+        // inside the layout, regardless of text baseline.
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 9px;
+                height: 9px;
+                border-radius: 4.5px;
+                background: root.running ? #2e7d32 : #888888;
+            }
+        }
+        Text {
+            text: root.text;
+            color: Palette.foreground;
+            vertical-alignment: center;
+            font-size: 12px;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A rounded card with an optional heading above. Acts as a drop-in
+// replacement for std-widgets' GroupBox but with the modern flat look.
+component SectionCard {
+    in property <string> heading;
+    in property <length> content_spacing: 10px;
+    in property <length> content_padding: 16px;
+
+    VerticalLayout {
+        spacing: 8px;
+
+        if root.heading != "" : Text {
+            text: root.heading;
+            font-size: 13px;
+            font-weight: 600;
+            color: Palette.foreground;
+        }
+
+        Rectangle {
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.border;
+            background: Palette.alternate-background;
+
+            VerticalLayout {
+                padding: root.content_padding;
+                spacing: root.content_spacing;
+                @children
+            }
+        }
+    }
+}
+
+component LabeledField inherits HorizontalLayout {
+    in property <string> label;
+    in property <length> label_width: 110px;
     spacing: 8px;
     alignment: stretch;
     Text {
         text: root.label;
         vertical-alignment: center;
         width: root.label_width;
+        font-size: 13px;
     }
     @children
 }
@@ -73,15 +214,33 @@ component LabeledField inherits HorizontalBox {
 export component AppWindow inherits Window {
     title: "stable-diffusion.cpp configurator";
     icon: window_icon;
-    min-width: 820px;
-    min-height: 620px;
-    preferred-width: 980px;
-    preferred-height: 720px;
+    // Sized for the Models tab, which is the densest page: 200px nav rail +
+    // 240px preset list + LabeledField rows that pack a 110px label, an
+    // elastic LineEdit, and a "…" browse button. Below ~1000px the browse
+    // buttons get pushed off the right edge.
+    min-width: 1000px;
+    min-height: 660px;
+    preferred-width: 1180px;
+    preferred-height: 760px;
+    background: Palette.background;
 
     // Set from Rust at startup (gui::set_window_icon) — decoded out of the
     // .ico embedded by build.rs. Slint's compile-time @image-url doesn't
     // handle .ico, so we go through the runtime image crate instead.
     in property <image> window_icon;
+
+    // ── Navigation ───────────────────────────────────────────────────
+    // 0 = Server, 1 = Models, 2 = MCP.
+    in-out property <int> current_tab: 0;
+
+    // ── Header / live status ─────────────────────────────────────────
+    // Driven by gui.rs reading run\sd-server.state on a 2s Timer.
+    in property <bool> server_running: false;
+    in property <string> server_status_text: "sd-server: not running";
+    // Output of `sd-server.exe --version`, parsed down to just the version
+    // tag (e.g. "master-596-90e87bc"). Empty until gui::spawn_version_probe
+    // finishes — the header hides the chip until then.
+    in property <string> server_version: "";
 
     // ── Server tab state ─────────────────────────────────────────────
     in-out property <string> server_port: "1234";
@@ -103,8 +262,55 @@ export component AppWindow inherits Window {
     in-out property <PresetForm> form;
     in-out property <string> presets_path: "";
 
+    // File-field dropdowns. For each of the six file fields (main model +
+    // five sub-models) `<field>_labels` is what the ComboBox shows (basename
+    // for scanned files, `(none)` / `(custom) <basename>` for the synthetic
+    // rows), `<field>_values` is the parallel array of absolute paths that
+    // get written into the preset, and `<field>_index` tracks the selected
+    // row. All three are rebuilt by gui::refresh_file_options() any time
+    // ModelsDir changes or a different preset is loaded.
+    in-out property <[string]> model_labels;
+    in-out property <[string]> model_values;
+    in-out property <int> model_index: -1;
+    in-out property <[string]> vae_labels;
+    in-out property <[string]> vae_values;
+    in-out property <int> vae_index: -1;
+    in-out property <[string]> llm_labels;
+    in-out property <[string]> llm_values;
+    in-out property <int> llm_index: -1;
+    in-out property <[string]> t5xxl_labels;
+    in-out property <[string]> t5xxl_values;
+    in-out property <int> t5xxl_index: -1;
+    in-out property <[string]> clip_l_labels;
+    in-out property <[string]> clip_l_values;
+    in-out property <int> clip_l_index: -1;
+    in-out property <[string]> clip_g_labels;
+    in-out property <[string]> clip_g_values;
+    in-out property <int> clip_g_index: -1;
+
     // ── MCP tab state ────────────────────────────────────────────────
     in-out property <[McpClient]> mcp_clients;
+
+    // ── New-preset dialog state ─────────────────────────────────────
+    // Flipped on by gui.rs when "New…" is clicked. The embedded modal
+    // shows a scanned list of model files (under ModelsDir, same
+    // category as the editor's Model dropdown) so the user picks from
+    // a list instead of an OS file browser. `new_dialog_source_id` is
+    // non-empty when a preset is selected in the list, in which case
+    // the Clone button is shown alongside Empty.
+    in-out property <bool> show_new_kind_picker: false;
+    in-out property <string> new_dialog_source_id: "";
+    in-out property <[string]> dialog_model_labels;
+    in-out property <[string]> dialog_model_values;
+    in-out property <int> dialog_model_index: -1;
+
+    // ── Rename-preset dialog state ──────────────────────────────────
+    // Flipped on by clicking "Rename…". `rename_old_id` is the section
+    // header about to be rewritten (read-only display); `rename_new_id`
+    // is the live editable buffer, pre-seeded with the current id.
+    in-out property <bool> show_rename_dialog: false;
+    in-out property <string> rename_old_id: "";
+    in-out property <string> rename_new_id: "";
 
     // ── Status / toast ───────────────────────────────────────────────
     in-out property <string> status_text: "";
@@ -112,166 +318,295 @@ export component AppWindow inherits Window {
 
     // ── Callbacks (Rust side) ───────────────────────────────────────
     callback save_server();
-    // pass current value; returns dialog result or the same value on cancel
+    callback revert_server();
     callback browse_models_dir(string) -> string;
 
     callback select_preset(int);
     callback save_preset();
+    callback revert_preset();
     callback delete_preset(string);
     callback new_preset();
-    callback browse_path(string, string) -> string;   // (field_id, current) -> new
+    callback pick_new_empty();
+    callback pick_new_clone();
+    callback rename_preset(string, string);
     callback browse_dir(string, string) -> string;
 
     callback mcp_install(string);
     callback mcp_uninstall(string);
     callback mcp_refresh();
 
-    VerticalBox {
-        padding: 12px;
-        spacing: 8px;
+    callback refresh_status();
 
-        TabWidget {
-            // ─────────────── Tab 1: Server ───────────────
-            Tab {
-                title: "Server";
-                ScrollView {
-                    VerticalBox {
-                        padding: 16px;
-                        spacing: 12px;
+    VerticalLayout {
+        spacing: 0px;
+
+        // ─── Header ─────────────────────────────────────────────────
+        Rectangle {
+            height: 56px;
+            background: Palette.alternate-background;
+            // Bottom hairline divider.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Palette.border;
+            }
+
+            HorizontalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                spacing: 12px;
+                alignment: stretch;
+
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: root.window_icon;
+                        width: 28px;
+                        height: 28px;
+                        image-fit: contain;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "stable-diffusion.cpp";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    StatusPill {
+                        running: root.server_running;
+                        text: root.server_status_text;
+                        clicked => { root.refresh_status(); }
+                    }
+                    if root.server_version != "" : Text {
+                        text: root.server_version;
+                        font-size: 10px;
+                        color: Palette.foreground.transparentize(0.55);
+                        horizontal-alignment: right;
+                    }
+                }
+            }
+        }
+
+        // ─── Body: nav rail | content ─────────────────────────────
+        HorizontalLayout {
+            spacing: 0px;
+            vertical-stretch: 1;
+
+            // Nav rail
+            Rectangle {
+                width: 200px;
+                background: Palette.background;
+                Rectangle {
+                    x: parent.width - 1px;
+                    width: 1px;
+                    background: Palette.border;
+                }
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 4px;
+                    alignment: start;
+
+                    NavItem {
+                        // Segoe Fluent Icons: Settings (gear)
+                        glyph: "\u{E713}";
+                        label: "Server";
+                        selected: root.current_tab == 0;
+                        clicked => { root.current_tab = 0; }
+                    }
+                    NavItem {
+                        // Segoe Fluent Icons: Pictures
+                        glyph: "\u{EB9F}";
+                        label: "Models";
+                        selected: root.current_tab == 1;
+                        clicked => { root.current_tab = 1; }
+                    }
+                    NavItem {
+                        // Segoe Fluent Icons: PlugConnected
+                        glyph: "\u{F003}";
+                        label: "MCP clients";
+                        selected: root.current_tab == 2;
+                        clicked => { root.current_tab = 2; }
+                    }
+                }
+            }
+
+            // Content area — page is selected by `current_tab`. The inner
+            // VerticalLayout ensures whichever conditional page is active
+            // stretches to fill the available room (a bare Rectangle gives
+            // its children their preferred size only).
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Palette.background;
+
+                VerticalLayout {
+
+                // ─────────────── Page 0: Server ───────────────
+                if root.current_tab == 0 : ScrollView {
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 16px;
                         alignment: start;
 
                         Text {
-                            text: "Machine-wide sd-server settings (server.ini)";
-                            font-size: 16px;
-                            font-weight: 700;
+                            text: "Server";
+                            font-size: 22px;
+                            font-weight: 600;
+                            color: Palette.foreground;
                         }
                         Text {
-                            text: "Per-model knobs live in the Models tab. Re-runnable any time.";
+                            text: "Machine-wide sd-server settings (server.ini). Per-model knobs live under Models.";
                             color: Palette.foreground.transparentize(0.4);
+                            font-size: 12px;
                             wrap: word-wrap;
                         }
 
-                        GroupBox {
-                            title: "Network";
-                            VerticalBox {
-                                spacing: 8px;
-                                LabeledField {
-                                    label: "Port";
-                                    LineEdit {
-                                        text: root.server_port;
-                                        input-type: number;
-                                        placeholder-text: "1234";
-                                        edited(t) => { root.server_port = t; }
-                                    }
+                        SectionCard {
+                            heading: "Network";
+                            LabeledField {
+                                label: "Port";
+                                LineEdit {
+                                    text: root.server_port;
+                                    input-type: number;
+                                    placeholder-text: "1234";
+                                    edited(t) => { root.server_port = t; }
                                 }
-                                LabeledField {
-                                    label: "Bind to";
-                                    ComboBox {
-                                        model: root.bind_labels;
-                                        current-index: root.bind_index;
-                                        selected(value) => {
-                                            root.bind_index = self.current-index;
-                                            if (self.current-index >= 0 && self.current-index < root.bind_values.length) {
-                                                root.server_hostname = root.bind_values[self.current-index];
-                                            }
+                            }
+                            LabeledField {
+                                label: "Bind to";
+                                ComboBox {
+                                    model: root.bind_labels;
+                                    current-index: root.bind_index;
+                                    selected(value) => {
+                                        root.bind_index = self.current-index;
+                                        if (self.current-index >= 0 && self.current-index < root.bind_values.length) {
+                                            root.server_hostname = root.bind_values[self.current-index];
                                         }
                                     }
                                 }
                             }
                         }
 
-                        GroupBox {
-                            title: "Resources";
-                            VerticalBox {
-                                spacing: 8px;
-                                LabeledField {
-                                    label: "CPU threads";
-                                    LineEdit {
-                                        text: root.server_threads;
-                                        input-type: number;
-                                        placeholder-text: "blank = sd-server picks physical-core count";
-                                        edited(t) => { root.server_threads = t; }
-                                    }
+                        SectionCard {
+                            heading: "Resources";
+                            LabeledField {
+                                label: "CPU threads";
+                                LineEdit {
+                                    text: root.server_threads;
+                                    input-type: number;
+                                    placeholder-text: "blank = half the physical-core count";
+                                    edited(t) => { root.server_threads = t; }
                                 }
-                                LabeledField {
-                                    label: "Models folder";
-                                    LineEdit {
-                                        text: root.server_models_dir;
-                                        placeholder-text: "where your .gguf / .safetensors files live";
-                                        edited(t) => { root.server_models_dir = t; }
-                                    }
-                                    Button {
-                                        text: "Browse…";
-                                        clicked => {
-                                            root.server_models_dir = root.browse_models_dir(root.server_models_dir);
-                                        }
+                            }
+                            LabeledField {
+                                label: "Models folder";
+                                LineEdit {
+                                    text: root.server_models_dir;
+                                    placeholder-text: "where your .gguf / .safetensors files live";
+                                    edited(t) => { root.server_models_dir = t; }
+                                }
+                                Button {
+                                    text: "Browse…";
+                                    clicked => {
+                                        root.server_models_dir = root.browse_models_dir(root.server_models_dir);
                                     }
                                 }
                             }
                         }
 
-                        HorizontalBox {
+                        HorizontalLayout {
                             alignment: end;
                             spacing: 8px;
                             Button {
-                                text: "Save server.ini";
+                                text: "Revert";
+                                clicked => { root.revert_server(); }
+                            }
+                            Button {
+                                text: "Save changes";
                                 primary: true;
                                 clicked => { root.save_server(); }
                             }
                         }
                     }
                 }
-            }
 
-            // ─────────────── Tab 2: Models / presets ───────────────
-            Tab {
-                title: "Models";
-                HorizontalBox {
-                    padding: 12px;
-                    spacing: 12px;
+                // ─────────────── Page 1: Models ───────────────
+                if root.current_tab == 1 : HorizontalLayout {
+                    padding: 20px;
+                    spacing: 16px;
 
                     // Left column: preset list
-                    VerticalBox {
+                    VerticalLayout {
                         width: 240px;
-                        spacing: 8px;
+                        spacing: 10px;
+
                         Text {
                             text: "Presets";
                             font-size: 14px;
-                            font-weight: 700;
+                            font-weight: 600;
+                            color: Palette.foreground;
                         }
+
                         Rectangle {
                             border-width: 1px;
                             border-color: Palette.border;
-                            border-radius: 4px;
+                            border-radius: 8px;
                             background: Palette.alternate-background;
-                            min-height: 240px;
+                            min-height: 280px;
+                            vertical-stretch: 1;
+
                             ListView {
                                 for p[i] in root.presets : Rectangle {
                                     height: 36px;
                                     background: i == root.selected_preset_index
-                                        ? Palette.accent-background
-                                        : transparent;
-                                    HorizontalBox {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
+                                        ? Palette.accent-background.transparentize(0.82)
+                                        : (item-touch.has-hover ? Palette.background : transparent);
+
+                                    if i == root.selected_preset_index : Rectangle {
+                                        x: 0; y: 6px; width: 3px; height: parent.height - 12px;
+                                        border-radius: 1.5px;
+                                        background: Palette.accent-background;
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
                                         Text {
                                             text: p.id;
-                                            color: i == root.selected_preset_index ? Palette.accent-foreground : Palette.foreground;
+                                            font-size: 12px;
+                                            color: Palette.foreground;
                                             vertical-alignment: center;
                                             overflow: elide;
                                         }
                                     }
-                                    TouchArea {
+                                    item-touch := TouchArea {
+                                        mouse-cursor: pointer;
                                         clicked => { root.select_preset(i); }
                                     }
                                 }
                             }
                         }
-                        HorizontalBox {
+
+                        HorizontalLayout {
                             spacing: 6px;
                             Button {
                                 text: "New…";
                                 clicked => { root.new_preset(); }
+                            }
+                            Button {
+                                text: "Rename…";
+                                enabled: root.selected_preset_index >= 0;
+                                clicked => {
+                                    root.rename_old_id = root.form.id;
+                                    root.rename_new_id = root.form.id;
+                                    root.show_rename_dialog = true;
+                                }
                             }
                             Button {
                                 text: "Delete";
@@ -279,6 +614,7 @@ export component AppWindow inherits Window {
                                 clicked => { root.delete_preset(root.form.id); }
                             }
                         }
+
                         Text {
                             text: root.presets_path;
                             font-size: 10px;
@@ -287,189 +623,227 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // Right column: editor
+                    // Right column: editor.
                     ScrollView {
                         horizontal-stretch: 1;
-                        VerticalBox {
-                            padding: 4px;
-                            spacing: 10px;
+                        VerticalLayout {
+                            padding-left: 4px;
+                            padding-right: 4px;
+                            spacing: 14px;
 
                             Text {
                                 text: root.selected_preset_index >= 0
                                     ? "Preset id: " + root.form.id
                                     : "Select a preset on the left, or click New…";
                                 font-size: 14px;
-                                font-weight: 700;
+                                font-weight: 600;
+                                color: Palette.foreground;
                             }
 
-                            GroupBox {
-                                title: "Model";
-                                VerticalBox {
-                                    spacing: 6px;
-                                    LabeledField {
-                                        label: "Type";
-                                        ComboBox {
-                                            model: ["standalone (Flux/SD3/Wan/Qwen…)", "allinone (SD1.x/SDXL bundle)"];
-                                            current-index: root.form.model_type == "allinone" ? 1 : 0;
-                                            selected(value) => {
-                                                root.form.model_type = self.current-index == 1 ? "allinone" : "standalone";
+                            SectionCard {
+                                heading: "Model";
+                                LabeledField {
+                                    label: "Type";
+                                    ComboBox {
+                                        model: ["standalone (Flux/SD3/Wan/Qwen…)", "allinone (SD1.x/SDXL bundle)"];
+                                        current-index: root.form.model_type == "allinone" ? 1 : 0;
+                                        selected(value) => {
+                                            root.form.model_type = self.current-index == 1 ? "allinone" : "standalone";
+                                        }
+                                    }
+                                }
+                                LabeledField {
+                                    label: "File";
+                                    ComboBox {
+                                        model: root.model_labels;
+                                        // `<=>` (not `:`) because std-widgets' ComboBoxBase has a
+                                        // `changed model => reset-current()` hook that writes to its
+                                        // own current-index on every model swap. With a one-way `:`
+                                        // binding that internal write severs the link to
+                                        // root.model_index — display freezes after the first preset
+                                        // switch. Two-way keeps both sides in lockstep.
+                                        current-index <=> root.model_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.model_values.length) {
+                                                root.form.model = root.model_values[self.current-index];
                                             }
                                         }
                                     }
-                                    LabeledField {
-                                        label: "File";
-                                        LineEdit {
-                                            text: root.form.model;
-                                            edited(t) => { root.form.model = t; }
-                                        }
-                                        Button {
-                                            text: "…";
-                                            clicked => {
-                                                root.form.model = root.browse_path("model", root.form.model);
+                                }
+                            }
+
+                            SectionCard {
+                                heading: "Sub-model paths (only what the architecture needs)";
+                                LabeledField {
+                                    label: "VAE";
+                                    ComboBox {
+                                        model: root.vae_labels;
+                                        // See `current-index <=> root.model_index` above for why.
+                                        current-index <=> root.vae_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.vae_values.length) {
+                                                root.form.vae = root.vae_values[self.current-index];
                                             }
                                         }
                                     }
                                 }
-                            }
-
-                            GroupBox {
-                                title: "Sub-model paths (only what the architecture needs)";
-                                VerticalBox {
-                                    spacing: 6px;
-
-                                    LabeledField {
-                                        label: "VAE";
-                                        LineEdit { text: root.form.vae; edited(t) => { root.form.vae = t; } }
-                                        Button { text: "…"; clicked => { root.form.vae = root.browse_path("vae", root.form.vae); } }
+                                LabeledField {
+                                    label: "LLM";
+                                    ComboBox {
+                                        model: root.llm_labels;
+                                        current-index <=> root.llm_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.llm_values.length) {
+                                                root.form.llm = root.llm_values[self.current-index];
+                                            }
+                                        }
                                     }
-                                    LabeledField {
-                                        label: "LLM";
-                                        LineEdit { text: root.form.llm; edited(t) => { root.form.llm = t; } }
-                                        Button { text: "…"; clicked => { root.form.llm = root.browse_path("llm", root.form.llm); } }
+                                }
+                                LabeledField {
+                                    label: "T5-XXL";
+                                    ComboBox {
+                                        model: root.t5xxl_labels;
+                                        current-index <=> root.t5xxl_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.t5xxl_values.length) {
+                                                root.form.t5xxl = root.t5xxl_values[self.current-index];
+                                            }
+                                        }
                                     }
-                                    LabeledField {
-                                        label: "T5-XXL";
-                                        LineEdit { text: root.form.t5xxl; edited(t) => { root.form.t5xxl = t; } }
-                                        Button { text: "…"; clicked => { root.form.t5xxl = root.browse_path("t5xxl", root.form.t5xxl); } }
+                                }
+                                LabeledField {
+                                    label: "CLIP-L";
+                                    ComboBox {
+                                        model: root.clip_l_labels;
+                                        current-index <=> root.clip_l_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.clip_l_values.length) {
+                                                root.form.clip_l = root.clip_l_values[self.current-index];
+                                            }
+                                        }
                                     }
-                                    LabeledField {
-                                        label: "CLIP-L";
-                                        LineEdit { text: root.form.clip_l; edited(t) => { root.form.clip_l = t; } }
-                                        Button { text: "…"; clicked => { root.form.clip_l = root.browse_path("clip_l", root.form.clip_l); } }
+                                }
+                                LabeledField {
+                                    label: "CLIP-G";
+                                    ComboBox {
+                                        model: root.clip_g_labels;
+                                        current-index <=> root.clip_g_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.clip_g_values.length) {
+                                                root.form.clip_g = root.clip_g_values[self.current-index];
+                                            }
+                                        }
                                     }
-                                    LabeledField {
-                                        label: "CLIP-G";
-                                        LineEdit { text: root.form.clip_g; edited(t) => { root.form.clip_g = t; } }
-                                        Button { text: "…"; clicked => { root.form.clip_g = root.browse_path("clip_g", root.form.clip_g); } }
-                                    }
-                                    LabeledField {
-                                        label: "LoRA dir";
-                                        LineEdit { text: root.form.lora_dir; edited(t) => { root.form.lora_dir = t; } }
-                                        Button { text: "…"; clicked => { root.form.lora_dir = root.browse_dir("lora_dir", root.form.lora_dir); } }
-                                    }
-                                    LabeledField {
-                                        label: "Embed dir";
-                                        LineEdit { text: root.form.embd_dir; edited(t) => { root.form.embd_dir = t; } }
-                                        Button { text: "…"; clicked => { root.form.embd_dir = root.browse_dir("embd_dir", root.form.embd_dir); } }
-                                    }
+                                }
+                                LabeledField {
+                                    label: "LoRA dir";
+                                    LineEdit { text: root.form.lora_dir; edited(t) => { root.form.lora_dir = t; } }
+                                    Button { text: "…"; clicked => { root.form.lora_dir = root.browse_dir("lora_dir", root.form.lora_dir); } }
+                                }
+                                LabeledField {
+                                    label: "Embed dir";
+                                    LineEdit { text: root.form.embd_dir; edited(t) => { root.form.embd_dir = t; } }
+                                    Button { text: "…"; clicked => { root.form.embd_dir = root.browse_dir("embd_dir", root.form.embd_dir); } }
                                 }
                             }
 
-                            GroupBox {
-                                title: "Memory / performance";
-                                VerticalBox {
-                                    spacing: 6px;
-                                    LabeledField {
-                                        label: "Weight type";
-                                        ComboBox {
-                                            model: ["", "f32", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_K", "q3_K", "q4_K"];
-                                            current-value: root.form.weight_type;
-                                            selected(value) => { root.form.weight_type = value; }
-                                        }
+                            SectionCard {
+                                heading: "Memory / performance";
+                                LabeledField {
+                                    label: "Weight type";
+                                    ComboBox {
+                                        model: ["", "f32", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_K", "q3_K", "q4_K"];
+                                        current-value: root.form.weight_type;
+                                        selected(value) => { root.form.weight_type = value; }
                                     }
-                                    LabeledField {
-                                        label: "Max VRAM (GiB)";
-                                        LineEdit {
-                                            text: root.form.max_vram;
-                                            placeholder-text: "blank = unlimited";
-                                            edited(t) => { root.form.max_vram = t; }
-                                        }
+                                }
+                                LabeledField {
+                                    label: "Max VRAM (GiB)";
+                                    LineEdit {
+                                        text: root.form.max_vram;
+                                        placeholder-text: "blank = unlimited";
+                                        edited(t) => { root.form.max_vram = t; }
                                     }
-                                    HorizontalBox {
-                                        spacing: 16px;
-                                        CheckBox { text: "offload-to-cpu"; checked: root.form.offload_to_cpu; toggled => { root.form.offload_to_cpu = self.checked; } }
-                                        CheckBox { text: "mmap";           checked: root.form.mmap;           toggled => { root.form.mmap = self.checked; } }
-                                        CheckBox { text: "fa";             checked: root.form.fa;             toggled => { root.form.fa = self.checked; } }
-                                        CheckBox { text: "diffusion-fa";   checked: root.form.diffusion_fa;   toggled => { root.form.diffusion_fa = self.checked; } }
-                                    }
-                                    HorizontalBox {
-                                        spacing: 16px;
-                                        CheckBox { text: "clip-on-cpu";    checked: root.form.clip_on_cpu;    toggled => { root.form.clip_on_cpu = self.checked; } }
-                                        CheckBox { text: "vae-on-cpu";     checked: root.form.vae_on_cpu;     toggled => { root.form.vae_on_cpu = self.checked; } }
-                                        CheckBox { text: "vae-tiling";     checked: root.form.vae_tiling;     toggled => { root.form.vae_tiling = self.checked; } }
-                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 16px;
+                                    CheckBox { text: "offload-to-cpu"; checked: root.form.offload_to_cpu; toggled => { root.form.offload_to_cpu = self.checked; } }
+                                    CheckBox { text: "mmap";           checked: root.form.mmap;           toggled => { root.form.mmap = self.checked; } }
+                                    CheckBox { text: "fa";             checked: root.form.fa;             toggled => { root.form.fa = self.checked; } }
+                                    CheckBox { text: "diffusion-fa";   checked: root.form.diffusion_fa;   toggled => { root.form.diffusion_fa = self.checked; } }
+                                }
+                                HorizontalLayout {
+                                    spacing: 16px;
+                                    CheckBox { text: "clip-on-cpu";    checked: root.form.clip_on_cpu;    toggled => { root.form.clip_on_cpu = self.checked; } }
+                                    CheckBox { text: "vae-on-cpu";     checked: root.form.vae_on_cpu;     toggled => { root.form.vae_on_cpu = self.checked; } }
+                                    CheckBox { text: "vae-tiling";     checked: root.form.vae_tiling;     toggled => { root.form.vae_tiling = self.checked; } }
                                 }
                             }
 
-                            GroupBox {
-                                title: "Default generation parameters";
-                                VerticalBox {
-                                    spacing: 6px;
-                                    LabeledField {
-                                        label: "Sampler";
-                                        ComboBox {
-                                            model: ["euler_a","euler","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","lcm","ipndm","ipndm_v","ddim_trailing","tcd"];
-                                            current-value: root.form.sampler == "" ? "euler_a" : root.form.sampler;
-                                            selected(value) => { root.form.sampler = value; }
-                                        }
+                            SectionCard {
+                                heading: "Default generation parameters";
+                                LabeledField {
+                                    label: "Sampler";
+                                    ComboBox {
+                                        model: ["euler_a","euler","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","lcm","ipndm","ipndm_v","ddim_trailing","tcd"];
+                                        current-value: root.form.sampler == "" ? "euler_a" : root.form.sampler;
+                                        selected(value) => { root.form.sampler = value; }
                                     }
+                                }
+                                LabeledField {
+                                    label: "Steps";
+                                    LineEdit {
+                                        text: "\{root.form.steps}";
+                                        input-type: number;
+                                        edited(t) => { root.form.steps = t.to-float(); }
+                                    }
+                                }
+                                LabeledField {
+                                    label: "CFG scale";
+                                    LineEdit {
+                                        text: root.form.cfg_scale;
+                                        edited(t) => { root.form.cfg_scale = t; }
+                                    }
+                                }
+                                LabeledField {
+                                    label: "Guidance";
+                                    LineEdit {
+                                        text: root.form.guidance;
+                                        placeholder-text: "Flux/Flux2 only (default 3.5); blank = unset";
+                                        edited(t) => { root.form.guidance = t; }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 12px;
                                     LabeledField {
-                                        label: "Steps";
+                                        label: "Width";
+                                        label_width: 60px;
                                         LineEdit {
-                                            text: "\{root.form.steps}";
+                                            text: "\{root.form.width}";
                                             input-type: number;
-                                            edited(t) => { root.form.steps = t.to-float(); }
+                                            edited(t) => { root.form.width = t.to-float(); }
                                         }
                                     }
                                     LabeledField {
-                                        label: "CFG scale";
+                                        label: "Height";
+                                        label_width: 60px;
                                         LineEdit {
-                                            text: root.form.cfg_scale;
-                                            edited(t) => { root.form.cfg_scale = t; }
-                                        }
-                                    }
-                                    LabeledField {
-                                        label: "Guidance";
-                                        LineEdit {
-                                            text: root.form.guidance;
-                                            placeholder-text: "Flux/Flux2 only (default 3.5); blank = unset";
-                                            edited(t) => { root.form.guidance = t; }
-                                        }
-                                    }
-                                    HorizontalBox {
-                                        spacing: 12px;
-                                        LabeledField {
-                                            label: "Width";
-                                            LineEdit {
-                                                text: "\{root.form.width}";
-                                                input-type: number;
-                                                edited(t) => { root.form.width = t.to-float(); }
-                                            }
-                                        }
-                                        LabeledField {
-                                            label: "Height";
-                                            LineEdit {
-                                                text: "\{root.form.height}";
-                                                input-type: number;
-                                                edited(t) => { root.form.height = t.to-float(); }
-                                            }
+                                            text: "\{root.form.height}";
+                                            input-type: number;
+                                            edited(t) => { root.form.height = t.to-float(); }
                                         }
                                     }
                                 }
                             }
 
-                            HorizontalBox {
+                            HorizontalLayout {
                                 alignment: end;
+                                spacing: 8px;
+                                Button {
+                                    text: "Revert";
+                                    enabled: root.selected_preset_index >= 0;
+                                    clicked => { root.revert_preset(); }
+                                }
                                 Button {
                                     text: "Save preset";
                                     primary: true;
@@ -480,52 +854,79 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-            }
 
-            // ─────────────── Tab 3: MCP clients ───────────────
-            Tab {
-                title: "MCP";
-                ScrollView {
-                    VerticalBox {
-                        padding: 16px;
-                        spacing: 12px;
+                // ─────────────── Page 2: MCP clients ───────────────
+                if root.current_tab == 2 : ScrollView {
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 14px;
+                        alignment: start;
 
-                        Text {
-                            text: "Register the stable-diffusion.cpp MCP server with your AI client";
-                            font-size: 16px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "Adds a `stable-diffusion-cpp` entry pointing at mcp-server.ps1 so the client can call generate_image, list_presets, switch_preset, etc. Other entries in your existing config are left untouched.";
-                            color: Palette.foreground.transparentize(0.4);
-                            wrap: word-wrap;
-                        }
+                        HorizontalLayout {
+                            alignment: stretch;
+                            spacing: 12px;
 
-                        HorizontalBox {
-                            alignment: end;
-                            Button {
-                                text: "Re-detect";
-                                clicked => { root.mcp_refresh(); }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+                                Text {
+                                    text: "MCP clients";
+                                    font-size: 22px;
+                                    font-weight: 600;
+                                    color: Palette.foreground;
+                                }
+                                Text {
+                                    text: "Register stable-diffusion.cpp with your AI client so it can call generate_image, list_presets, switch_preset, and friends. Existing entries in each client's config are left untouched.";
+                                    color: Palette.foreground.transparentize(0.4);
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: "Re-detect";
+                                    clicked => { root.mcp_refresh(); }
+                                }
                             }
                         }
 
                         for c in root.mcp_clients : Rectangle {
                             border-width: 1px;
                             border-color: Palette.border;
-                            border-radius: 6px;
+                            border-radius: 8px;
                             background: Palette.alternate-background;
-                            VerticalBox {
-                                padding: 12px;
-                                spacing: 6px;
-                                HorizontalBox {
-                                    alignment: space-between;
+
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    alignment: stretch;
+                                    spacing: 12px;
                                     Text {
                                         text: c.label;
-                                        font-weight: 700;
+                                        font-weight: 600;
+                                        font-size: 14px;
+                                        color: Palette.foreground;
+                                        horizontal-stretch: 1;
                                     }
-                                    Text {
-                                        text: c.installed ? "✓ installed" : "not installed";
-                                        color: c.installed ? #2e7d32 : Palette.foreground.transparentize(0.4);
+                                    // Status chip (mini-pill on the right edge of the card header)
+                                    Rectangle {
+                                        height: 22px;
+                                        width: badge.preferred-width + 18px;
+                                        border-radius: 11px;
+                                        background: c.installed
+                                            ? #2e7d32.transparentize(0.85)
+                                            : Palette.background;
+                                        border-width: 1px;
+                                        border-color: c.installed ? #2e7d32 : Palette.border;
+                                        badge := Text {
+                                            text: c.installed ? "installed" : "not installed";
+                                            color: c.installed ? #2e7d32 : Palette.foreground.transparentize(0.3);
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
                                     }
                                 }
                                 Text {
@@ -540,8 +941,9 @@ export component AppWindow inherits Window {
                                     color: #c62828;
                                     wrap: word-wrap;
                                 }
-                                HorizontalBox {
+                                HorizontalLayout {
                                     spacing: 8px;
+                                    alignment: start;
                                     Button {
                                         text: c.installed ? "Reinstall" : "Install";
                                         primary: !c.installed;
@@ -557,23 +959,223 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
+                } // /VerticalLayout (content swap)
             }
         }
 
-        // Status bar
+        // ─── Footer status bar ──────────────────────────────────────
         if root.status_text != "" : Rectangle {
-            background: root.status_is_error ? #c6282822 : Palette.alternate-background;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: root.status_is_error ? #c62828 : Palette.border;
             height: status_text.preferred-height + 16px;
+            background: root.status_is_error
+                ? #c62828.transparentize(0.88)
+                : Palette.alternate-background;
+            // Top hairline divider.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: root.status_is_error ? #c62828 : Palette.border;
+            }
             status_text := Text {
-                x: 8px;
-                width: parent.width - 16px;
+                x: 16px;
+                width: parent.width - 32px;
                 text: root.status_text;
                 color: root.status_is_error ? #c62828 : Palette.foreground;
+                font-size: 12px;
                 wrap: word-wrap;
                 vertical-alignment: center;
+            }
+        }
+    }
+
+    // ─── New-preset model picker (embedded modal) ─────────────────────
+    // Lives as a SIBLING of the main VerticalLayout (both children of
+    // Window), so it floats over the whole window instead of being
+    // sized as a row in the vertical stack. Shows the same scanned
+    // model list the editor's Model dropdown uses — the user selects
+    // a row, then clicks Empty (fresh defaults) or Clone (carry over
+    // every parameter from the source preset onto the picked model).
+    // Clone is hidden when nothing is selected in the preset list.
+    if root.show_new_kind_picker: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000.transparentize(0.45);
+        TouchArea {
+            clicked => { root.show_new_kind_picker = false; }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 520px;
+            height: 480px;
+            background: Palette.background;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Palette.border;
+            // Consume clicks inside the card so the backdrop TouchArea
+            // doesn't fire (it would dismiss the dialog otherwise).
+            TouchArea { }
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+                Text {
+                    text: "New preset";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: root.new_dialog_source_id == ""
+                        ? "Pick a model from your ModelsDir. The new preset will be created with default parameters."
+                        : "Pick a model from your ModelsDir. \"Empty\" creates a preset with default parameters; \"Clone\" copies every parameter of [" + root.new_dialog_source_id + "] onto the picked model.";
+                    wrap: word-wrap;
+                    font-size: 12px;
+                    color: Palette.foreground.transparentize(0.25);
+                }
+                Rectangle {
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 8px;
+                    background: Palette.alternate-background;
+                    vertical-stretch: 1;
+                    if root.dialog_model_labels.length == 0 : Text {
+                        x: 16px;
+                        y: 16px;
+                        width: parent.width - 32px;
+                        text: "No .gguf / .safetensors files found under ModelsDir. Drop files there and reopen this dialog.";
+                        wrap: word-wrap;
+                        font-size: 12px;
+                        color: Palette.foreground.transparentize(0.4);
+                    }
+                    ListView {
+                        for label[i] in root.dialog_model_labels : Rectangle {
+                            height: 32px;
+                            background: i == root.dialog_model_index
+                                ? Palette.accent-background.transparentize(0.82)
+                                : (touch.has-hover ? Palette.background : transparent);
+                            if i == root.dialog_model_index : Rectangle {
+                                x: 0; y: 4px; width: 3px; height: parent.height - 8px;
+                                border-radius: 1.5px;
+                                background: Palette.accent-background;
+                            }
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                Text {
+                                    text: label;
+                                    font-size: 12px;
+                                    color: Palette.foreground;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.dialog_model_index = i; }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.show_new_kind_picker = false; }
+                    }
+                    Button {
+                        text: root.new_dialog_source_id == "" ? "Create" : "Empty";
+                        enabled: root.dialog_model_index >= 0;
+                        clicked => {
+                            root.show_new_kind_picker = false;
+                            root.pick_new_empty();
+                        }
+                    }
+                    if root.new_dialog_source_id != "" : Button {
+                        text: "Clone…";
+                        enabled: root.dialog_model_index >= 0;
+                        clicked => {
+                            root.show_new_kind_picker = false;
+                            root.pick_new_clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── Rename-preset modal ─────────────────────────────────────────
+    // Single-field input that rewrites only the `[id]` header line in
+    // presets.ini — the keys/comments below stay byte-for-byte intact
+    // (see ini::rename_section). Submit on Enter via the LineEdit's
+    // `accepted` callback so the dialog feels like a native rename.
+    if root.show_rename_dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000.transparentize(0.45);
+        TouchArea {
+            clicked => { root.show_rename_dialog = false; }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 440px;
+            height: 220px;
+            background: Palette.background;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Palette.border;
+            // Eat clicks so the backdrop dismiss doesn't fire underneath.
+            TouchArea { }
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+                Text {
+                    text: "Rename preset";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: "Renaming [" + root.rename_old_id + "]. This only changes the section header in presets.ini; every parameter inside is preserved.";
+                    wrap: word-wrap;
+                    font-size: 12px;
+                    color: Palette.foreground.transparentize(0.25);
+                }
+                LineEdit {
+                    text: root.rename_new_id;
+                    placeholder-text: "New id";
+                    edited(t) => { root.rename_new_id = t; }
+                    accepted(t) => {
+                        root.rename_new_id = t;
+                        if (t != "" && t != root.rename_old_id) {
+                            root.show_rename_dialog = false;
+                            root.rename_preset(root.rename_old_id, t);
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.show_rename_dialog = false; }
+                    }
+                    Button {
+                        text: "Rename";
+                        primary: true;
+                        enabled: root.rename_new_id != "" && root.rename_new_id != root.rename_old_id;
+                        clicked => {
+                            root.show_rename_dialog = false;
+                            root.rename_preset(root.rename_old_id, root.rename_new_id);
+                        }
+                    }
+                }
             }
         }
     }

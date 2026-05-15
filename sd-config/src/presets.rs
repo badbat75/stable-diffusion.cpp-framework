@@ -16,7 +16,7 @@ use crate::ini;
 use crate::paths;
 use crate::server_cfg;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Preset {
     pub id: String,
     pub model_type: String, // "allinone" | "standalone"
@@ -45,21 +45,41 @@ pub struct Preset {
     pub height: Option<i32>,
 }
 
-impl Preset {
-    pub fn new_default(id: String, model: String, model_type: String) -> Self {
+impl Default for Preset {
+    fn default() -> Self {
         Self {
-            id,
-            model,
-            model_type,
+            id: String::new(),
+            model_type: String::new(),
+            model: String::new(),
+            vae: String::new(),
+            llm: String::new(),
+            t5xxl: String::new(),
+            clip_l: String::new(),
+            clip_g: String::new(),
+            lora_dir: String::new(),
+            embd_dir: String::new(),
+            weight_type: String::new(),
+            offload_to_cpu: None,
             mmap: Some(true),
+            fa: None,
             diffusion_fa: Some(true),
+            clip_on_cpu: None,
+            vae_on_cpu: None,
+            vae_tiling: None,
+            max_vram: None,
             sampler: "euler_a".into(),
             steps: Some(20),
             cfg_scale: Some(7.0),
+            guidance: None,
             width: Some(512),
             height: Some(512),
-            ..Default::default()
         }
+    }
+}
+
+impl Preset {
+    pub fn new_default(id: String, model: String, model_type: String) -> Self {
+        Self { id, model, model_type, ..Default::default() }
     }
 
     fn from_keys(id: &str, k: &std::collections::BTreeMap<String, String>) -> Self {
@@ -117,10 +137,14 @@ pub fn save(preset: &Preset) -> io::Result<()> {
     }
     let body = render_section(preset);
     ini::replace_section(&path, &preset.id, &body)?;
-    // Also touch ModelsDir in server.ini so run-server / the next config run
-    // sees the updated default.
-    if let Some(models_dir) = infer_models_dir(&preset.model) {
-        let _ = ini::replace_key(&paths::server_ini(), "Server", "ModelsDir", &models_dir);
+    // Only seed ModelsDir in server.ini when the user hasn't picked one yet.
+    // Otherwise saving a preset from a sibling folder would silently move the
+    // global ModelsDir, surprising users with a multi-rooted model layout.
+    let current = server_cfg::load().models_dir.unwrap_or_default();
+    if current.is_empty() {
+        if let Some(models_dir) = infer_models_dir(&preset.model) {
+            let _ = ini::replace_key(&paths::server_ini(), "Server", "ModelsDir", &models_dir);
+        }
     }
     Ok(())
 }
@@ -128,6 +152,27 @@ pub fn save(preset: &Preset) -> io::Result<()> {
 pub fn delete(id: &str) -> io::Result<()> {
     let path = paths::presets_ini();
     ini::delete_section(&path, id)
+}
+
+/// Rename a preset by rewriting its section header in place. Returns
+/// `AlreadyExists` if `new_id` is already taken by another preset, `NotFound`
+/// if `old_id` doesn't exist, `InvalidInput` if `new_id` is empty / unchanged.
+pub fn rename(old_id: &str, new_id: &str) -> io::Result<()> {
+    let new = new_id.trim();
+    if new.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "new preset id is empty",
+        ));
+    }
+    if new == old_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "new preset id is unchanged",
+        ));
+    }
+    let path = paths::presets_ini();
+    ini::rename_section(&path, old_id, new)
 }
 
 /// Derive a filesystem-safe id from a model file path: basename, sans
@@ -157,21 +202,7 @@ pub fn make_id(model_path: &str) -> String {
 
 fn strip_shard_suffix(stem: &str) -> String {
     // matches `-\d{5}-of-\d{5}$`
-    if stem.len() < 12 {
-        return stem.to_string();
-    }
-    let tail = &stem[stem.len() - 12..];
-    let bytes = tail.as_bytes();
-    if bytes[0] == b'-'
-        && bytes[1..6].iter().all(|b| b.is_ascii_digit())
-        && &bytes[6..10] == b"-of-"
-        && bytes[10..].len() == 0 // unreachable, kept for clarity
-    {
-        return stem[..stem.len() - 12].to_string();
-    }
-    // Cleaner check using strip_suffix patterns:
-    if let Some(prefix) = stem.rsplit_once("-of-") {
-        let (head, tail) = prefix;
+    if let Some((head, tail)) = stem.rsplit_once("-of-") {
         if tail.len() == 5 && tail.chars().all(|c| c.is_ascii_digit()) {
             if let Some(idx) = head.rfind('-') {
                 let counter = &head[idx + 1..];
@@ -255,59 +286,4 @@ fn emit_i32(out: &mut String, key: &str, val: Option<i32>) {
     if let Some(v) = val {
         out.push_str(&format!("{key} = {v}\r\n"));
     }
-}
-
-/// Scan the models folder for .gguf / .safetensors files (recursive). For
-/// multi-shard models only return the first shard. Matches what
-/// the sd-config GUI's preset picker uses.
-#[allow(dead_code)] // surfaced for future "Add preset" picker logic
-pub fn scan_models() -> Vec<PathBuf> {
-    let dir = server_cfg::load()
-        .models_dir
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(server_cfg::default_models_dir);
-    let mut out = Vec::new();
-    walk(&PathBuf::from(dir), &mut out);
-    out.sort();
-    out
-}
-
-fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            walk(&p, out);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            let ext = ext.to_ascii_lowercase();
-            if ext == "gguf" || ext == "safetensors" {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if is_first_shard_or_unsharded(name) {
-                    out.push(p);
-                }
-            }
-        }
-    }
-}
-
-fn is_first_shard_or_unsharded(name: &str) -> bool {
-    let stem = std::path::Path::new(name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    // `-NNNNN-of-NNNNN` shard?
-    if let Some((head, total)) = stem.rsplit_once("-of-") {
-        if total.len() == 5
-            && total.chars().all(|c| c.is_ascii_digit())
-            && head.len() >= 6
-            && head[head.len() - 5..].chars().all(|c| c.is_ascii_digit())
-            && &head[head.len() - 6..head.len() - 5] == "-"
-        {
-            // Only keep first shard (`-00001-of-XXXXX`).
-            return &head[head.len() - 5..] == "00001";
-        }
-    }
-    true
 }

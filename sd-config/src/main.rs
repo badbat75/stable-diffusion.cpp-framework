@@ -12,10 +12,13 @@ mod cli;
 mod gui;
 mod ini;
 mod mcp;
+mod model_scan;
 mod net_ifaces;
 mod paths;
 mod presets;
+mod runstate;
 mod server_cfg;
+mod server_version;
 
 use clap::Parser;
 

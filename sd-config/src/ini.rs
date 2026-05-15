@@ -10,6 +10,7 @@
 // other section in the file byte-for-byte intact — the contract sd-config
 // relies on so hand-edits to non-touched presets survive a GUI save.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -47,10 +48,9 @@ pub fn read_all(path: &Path) -> Vec<Section> {
         let Some(s) = cur.as_mut() else { continue };
         if let Some(eq) = t.find('=') {
             let key = t[..eq].trim().to_string();
-            let mut val = t[eq + 1..].trim().to_string();
+            let val = t[eq + 1..].trim();
             // Strip an inline ` ; ...` or ` # ...` comment.
-            val = strip_inline_comment(&val);
-            s.keys.insert(key, val);
+            s.keys.insert(key, strip_inline_comment(val).into_owned());
         }
     }
     if let Some(s) = cur {
@@ -59,22 +59,31 @@ pub fn read_all(path: &Path) -> Vec<Section> {
     out
 }
 
-fn strip_inline_comment(val: &str) -> String {
+fn strip_inline_comment(val: &str) -> Cow<'_, str> {
     // Replicates the PS regex `^(.*?)\s+[;#]\s.*$`: comment marker must be
     // surrounded by whitespace, so `;` inside a path like
     // `C:\foo;bar\file` is preserved.
+    //
+    // The common case is "no inline comment present" — return the borrowed
+    // input unchanged so the caller can avoid an allocation entirely.
     let mut prev_was_space = false;
     for (i, c) in val.char_indices() {
         if (c == ';' || c == '#') && prev_was_space {
             let rest = &val[i + c.len_utf8()..];
             // require at least one char of trailing context (matches PS `\s.*$`)
             if rest.chars().next().map_or(false, char::is_whitespace) {
-                return val[..i].trim_end().to_string();
+                return Cow::Owned(val[..i].trim_end().to_string());
             }
         }
         prev_was_space = c.is_whitespace();
     }
-    val.trim_end().to_string()
+    // No inline comment → caller already trimmed; borrow the input as-is.
+    let trimmed = val.trim_end();
+    if trimmed.len() == val.len() {
+        Cow::Borrowed(val)
+    } else {
+        Cow::Borrowed(trimmed)
+    }
 }
 
 /// Read only the named section's keys, or empty if not present.
@@ -195,6 +204,40 @@ pub fn replace_section(path: &Path, section_name: &str, section_body: &str) -> s
     fs::write(path, out)
 }
 
+/// Rename a section in place by rewriting its `[old]` header line as `[new]`.
+/// Every key/comment/blank line within the section is preserved and the
+/// section keeps its position in the file (unlike a delete + re-save, which
+/// would move it to the end).
+///
+/// Errors with `NotFound` if `old` is missing, `AlreadyExists` if `new` is
+/// already present. Caller is responsible for guarding against `old == new`
+/// (which would also trigger AlreadyExists otherwise).
+pub fn rename_section(path: &Path, old: &str, new: &str) -> std::io::Result<()> {
+    let old_header = format!("[{old}]");
+    let new_header = format!("[{new}]");
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return Err(e),
+    };
+    let Some(pos) = find_section_header(&content, &old_header) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("section [{old}] not found"),
+        ));
+    };
+    if find_section_header(&content, &new_header).is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("section [{new}] already exists"),
+        ));
+    }
+    let mut out = String::with_capacity(content.len() + new.len());
+    out.push_str(&content[..pos]);
+    out.push_str(&new_header);
+    out.push_str(&content[pos + old_header.len()..]);
+    fs::write(path, out)
+}
+
 /// Remove a section entirely. No-op if missing.
 pub fn delete_section(path: &Path, section_name: &str) -> std::io::Result<()> {
     let header = format!("[{section_name}]");
@@ -218,7 +261,13 @@ pub fn delete_section(path: &Path, section_name: &str) -> std::io::Result<()> {
 
 fn line_starts_with_key(line: &str, key: &str) -> bool {
     let line = line.trim_start();
-    if !line.to_ascii_lowercase().starts_with(&key.to_ascii_lowercase()) {
+    // Keys in server.ini / presets.ini are pure-ASCII (PascalCase),
+    // so a byte-length slice is sound — but guard the char boundary
+    // defensively in case a future schema introduces non-ASCII keys.
+    if line.len() < key.len() || !line.is_char_boundary(key.len()) {
+        return false;
+    }
+    if !line[..key.len()].eq_ignore_ascii_case(key) {
         return false;
     }
     let rest = &line[key.len()..];

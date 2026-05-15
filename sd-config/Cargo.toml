@@ -16,8 +16,7 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = "1"
-dirs = "5"
-rfd = { version = "0.14", default-features = false, features = ["common-controls-v6"] }
+rfd = { version = "0.14", default-features = false }
 ico = "0.4"
 if-addrs = "0.13"
 

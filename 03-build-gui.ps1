@@ -6,7 +6,6 @@
 # auto-invokes this before staging if the binary is missing or older than the
 # Slint UI / Rust sources.
 
-[CmdletBinding()]
 param(
     # Run `cargo build` in debug mode instead of release.
     [switch]$Debug
@@ -29,19 +28,23 @@ if (-not $cargo) {
     throw "cargo not found"
 }
 
-$profile = if ($Debug) { 'debug' } else { 'release' }
-$profileFlag = if ($Debug) { @() } else { @('--release') }
+# NB: `$profile` is a PowerShell automatic variable holding the path to the
+# user's profile script — use a non-clashing name here.
+$profileName = if ($Debug) { 'debug' } else { 'release' }
 
 Push-Location $crateDir
 try {
-    Write-Host "Building sd-config ($profile) in $crateDir..." -ForegroundColor Cyan
-    & cargo build @profileFlag
+    Write-Host "Building sd-config ($profileName) in $crateDir..." -ForegroundColor Cyan
+    # Two literal branches instead of splatting an array — PowerShell unwraps
+    # `if (...) { @('--release') }` into a scalar string, which would then be
+    # splatted character-by-character into cargo's argv.
+    if ($Debug) { & cargo build } else { & cargo build --release }
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
 }
 
-$out = Join-Path $crateDir "target\$profile\sd-config.exe"
+$out = Join-Path $crateDir "target\$profileName\sd-config.exe"
 if (-not (Test-Path $out)) { throw "Build succeeded but binary is missing: $out" }
 
 $size = [math]::Round((Get-Item $out).Length / 1MB, 1)
