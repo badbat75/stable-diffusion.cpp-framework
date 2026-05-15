@@ -1,5 +1,5 @@
 ; stable-diffusion.cpp NSIS Installer Template
-; Placeholders replaced by 03-package.ps1:
+; Placeholders replaced by 04-package.ps1:
 ;   @VERSION@, @STAGING_DIR@, @OUTPUT_FILE@
 
 !include "MUI2.nsh"
@@ -15,78 +15,11 @@ InstallDirRegKey HKLM "Software\stable-diffusion.cpp" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor zlib
 
-; ── Variables for the install-time config page ──────────────────────
-; Only machine-wide knobs are configured at install time. Model-dependent
-; params (paths, sampler, steps, cfg, dimensions, fa, offload, etc.) live in
-; %LOCALAPPDATA%\stable-diffusion.cpp\config\presets.ini and are written by
-; config-model.ps1 lazily on first run.
-Var ServerPort
-Var ServerHostname     ; "localhost" or "0.0.0.0"
-Var ServerThreads      ; default = floor(cores * 0.5)
-Var ServerModelsDir    ; folder containing .gguf / .safetensors files
-
-; nsDialogs control handles
-Var Dialog
-Var Hwnd
-Var ServerPortBox
-Var ServerThreadsBox
-Var ServerLocalhostRadio
-Var ServerAllRadio
-Var ServerModelsDirBox
-Var ServerModelsDirBrowseBtn
-
 ; Write to the native 64-bit registry view, not Wow6432Node — otherwise
 ; PowerShell reading HKLM:\Software\stable-diffusion.cpp can't find our keys.
 ; Must be called from within a Function (not at top-level), so apply it in onInit.
 Function .onInit
     SetRegView 64
-    ; Page defaults
-    StrCpy $ServerPort     "1234"
-    StrCpy $ServerHostname "localhost"
-    StrCpy $ServerModelsDir "$PROFILE\.stable-diffusion.cpp\models"
-
-    ; Thread defaults — keep in sync with config-server.ps1 / run-server.ps1.
-    ; Threads = floor(cores * 0.5), floored to 1.
-    ReadEnvStr $0 "NUMBER_OF_PROCESSORS"
-    ${If} $0 == ""
-        StrCpy $0 "4"
-    ${EndIf}
-    IntOp $ServerThreads $0 / 2
-    ${If} $ServerThreads < 1
-        StrCpy $ServerThreads "1"
-    ${EndIf}
-
-    ; If the user already has %LOCALAPPDATA%\stable-diffusion.cpp\config\server.ini from
-    ; a previous install, surface those values as the install-page defaults so
-    ; the user sees their previous choices and can review/edit them.
-    ; config-server.ps1 in -DumpIni mode emits a UTF-16 LE INI under
-    ; $PLUGINSDIR that ReadINIStr (GetPrivateProfileStringW) can parse.
-    ; common-functions.ps1 holds the parser and is dot-sourced by
-    ; config-server.ps1, so it must be staged alongside it.
-    InitPluginsDir
-    File /oname=$PLUGINSDIR\config-server.ps1    "@STAGING_DIR@\config-server.ps1"
-    File /oname=$PLUGINSDIR\common-functions.ps1 "@STAGING_DIR@\common-functions.ps1"
-    Delete "$PLUGINSDIR\existing.ini"
-    nsExec::Exec 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\config-server.ps1" -DumpIni "$PLUGINSDIR\existing.ini"'
-    Pop $0
-    ${If} ${FileExists} "$PLUGINSDIR\existing.ini"
-        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Server" "Port"
-        ${If} $0 != ""
-            StrCpy $ServerPort $0
-        ${EndIf}
-        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Server" "Hostname"
-        ${If} $0 != ""
-            StrCpy $ServerHostname $0
-        ${EndIf}
-        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Server" "Threads"
-        ${If} $0 != ""
-            StrCpy $ServerThreads $0
-        ${EndIf}
-        ReadINIStr $0 "$PLUGINSDIR\existing.ini" "Server" "ModelsDir"
-        ${If} $0 != ""
-            StrCpy $ServerModelsDir $0
-        ${EndIf}
-    ${EndIf}
 FunctionEnd
 Function un.onInit
     SetRegView 64
@@ -96,11 +29,21 @@ FunctionEnd
 !define MUI_ICON "@STAGING_DIR@\stable-diffusion.ico"
 !define MUI_UNICON "@STAGING_DIR@\stable-diffusion.ico"
 
+; All configuration (Port / Hostname / Threads / ModelsDir / per-model
+; presets / MCP client registration) is handled post-install by the
+; sd-config GUI, launchable from the Finish page below or any time later
+; from the "Configure (GUI)" Start Menu shortcut. Keeping the installer
+; lean avoids duplicating the wizard's logic in two places.
+!define MUI_FINISHPAGE_RUN ""
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchConfigurator
+!define MUI_FINISHPAGE_RUN_TEXT "Launch the configuration tool now"
+; Default unchecked so silent / scripted installs don't pop a GUI.
+!define MUI_FINISHPAGE_RUN_NOTCHECKED
+
 !insertmacro MUI_PAGE_WELCOME
 Page custom CheckPreviousInstall
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
-Page custom ServerConfigPage ServerConfigPageLeave
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -134,6 +77,18 @@ Function CheckPreviousInstall
     done:
 FunctionEnd
 
+; ── Launch sd-config from the Finish page as the calling user ───────
+; The installer runs elevated (RequestExecutionLevel admin) but sd-config
+; writes per-user files under %LOCALAPPDATA%; launching it directly with
+; Exec would invoke it as the elevating admin, producing files in the
+; wrong profile. Spawning it via explorer.exe drops the elevation token
+; because explorer is already running under the user's session — a
+; well-known NSIS workaround that avoids pulling in UAC.dll / similar
+; plugins.
+Function LaunchConfigurator
+    Exec '"$WINDIR\explorer.exe" "$INSTDIR\bin\sd-config.exe"'
+FunctionEnd
+
 ; ── Main section: binaries ──────────────────────────────────────────
 Section "stable-diffusion.cpp binaries (required)" SecMain
     SectionIn RO
@@ -141,24 +96,15 @@ Section "stable-diffusion.cpp binaries (required)" SecMain
     SetOutPath "$INSTDIR\bin"
     File /r "@STAGING_DIR@\bin\*.*"
 
-    ; Runtime + init scripts. server.ini is written below from the values
-    ; collected on the install-time page; per-model presets land in
-    ; %LOCALAPPDATA%\stable-diffusion.cpp\config\presets.ini lazily on first
-    ; run of run-server.ps1 (which invokes config-model.ps1 if none exist).
+    ; Runtime + init scripts. server.ini / presets.ini / MCP-client configs
+    ; are written on demand by sd-config.exe (post-install GUI) or by the
+    ; CLI flavour of the same binary. The lazy fallback in run-server.ps1
+    ; still invokes the PowerShell wizards if the user never opens the GUI.
     SetOutPath "$INSTDIR"
     File "@STAGING_DIR@\run-server.ps1"
-    File "@STAGING_DIR@\config-model.ps1"
-    File "@STAGING_DIR@\config-server.ps1"
     File "@STAGING_DIR@\common-functions.ps1"
     File "@STAGING_DIR@\mcp-server.ps1"
-    File "@STAGING_DIR@\mcp-config.template.json"
     File "@STAGING_DIR@\stable-diffusion.ico"
-
-    ; Write user-scope server.ini from the install-time page values.
-    ; config-server.ps1 -NonInteractive preserves any existing ModelsDir set
-    ; by a previous install + config-model.ps1 run.
-    DetailPrint "Writing server config..."
-    nsExec::ExecToLog 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\config-server.ps1" -NonInteractive -Port $ServerPort -Hostname "$ServerHostname" -Threads $ServerThreads -ModelsDir "$ServerModelsDir"'
 
     ; Uninstaller
     WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -204,85 +150,21 @@ Section "Start Menu shortcuts" SecShortcuts
     ; writable per-user data dir so first-run files don't land in Program Files.
     SetOutPath "$LOCALAPPDATA\stable-diffusion.cpp"
     CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\stable-diffusion.cpp.lnk" "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\run-server.ps1$\"" "$INSTDIR\stable-diffusion.ico"
-    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Configure model.lnk" "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\config-model.ps1$\"" "$INSTDIR\stable-diffusion.ico"
-    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Configure sd-server.lnk" "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\config-server.ps1$\"" "$INSTDIR\stable-diffusion.ico"
+    ; sd-config.exe: GUI configurator (no args) backing server.ini, presets.ini,
+    ; and the MCP-client configs (Claude Code / Desktop / OpenCode). The same
+    ; binary also exposes a `server`, `preset`, `mcp` CLI for scripted use.
+    CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Configure.lnk" "$INSTDIR\bin\sd-config.exe" "" "$INSTDIR\bin\sd-config.exe"
     SetOutPath "$INSTDIR"
     CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\Uninstall.lnk" "$INSTDIR\uninstall.exe"
     ; Notify shell that Start Menu changed
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, p 0, p 0)'
 SectionEnd
 
-; ── Custom page functions ──────────────────────────────────────────
-Function ServerConfigPage
-    !insertmacro MUI_HEADER_TEXT "sd-server Configuration" "Set the bind address, port, CPU thread count, and models folder. Per-model parameters (model paths, sampler, steps, etc.) are configured on first launch."
-    nsDialogs::Create 1018
-    Pop $Dialog
-    ${If} $Dialog == error
-        Abort
-    ${EndIf}
-
-    ; Row 1: Port (left), CPU threads (right)
-    ${NSD_CreateLabel} 0 0u 48% 12u "Port:"
-    Pop $Hwnd
-    ${NSD_CreateNumber} 0 14u 48% 12u "$ServerPort"
-    Pop $ServerPortBox
-
-    ${NSD_CreateLabel} 52% 0u 48% 12u "CPU threads:"
-    Pop $Hwnd
-    ${NSD_CreateNumber} 52% 14u 48% 12u "$ServerThreads"
-    Pop $ServerThreadsBox
-
-    ; Row 2: Network exposure
-    ${NSD_CreateLabel} 0 36u 100% 12u "Network exposure:"
-    Pop $Hwnd
-    ${NSD_CreateRadioButton} 0 50u 100% 12u "localhost only (recommended)"
-    Pop $ServerLocalhostRadio
-    ${NSD_CreateRadioButton} 0 64u 100% 12u "All interfaces (LAN-reachable)"
-    Pop $ServerAllRadio
-    ${If} $ServerHostname == "0.0.0.0"
-        ${NSD_SetState} $ServerAllRadio ${BST_CHECKED}
-    ${Else}
-        ${NSD_SetState} $ServerLocalhostRadio ${BST_CHECKED}
-    ${EndIf}
-
-    ; Row 3: Models directory (text + Browse)
-    ${NSD_CreateLabel} 0 84u 100% 12u "Models folder (where your .gguf / .safetensors files are stored):"
-    Pop $Hwnd
-    ${NSD_CreateText} 0 98u 78% 12u "$ServerModelsDir"
-    Pop $ServerModelsDirBox
-    ${NSD_CreateBrowseButton} 80% 98u 20% 12u "Browse..."
-    Pop $ServerModelsDirBrowseBtn
-    ${NSD_OnClick} $ServerModelsDirBrowseBtn OnBrowseModelsDir
-
-    nsDialogs::Show
-FunctionEnd
-
-Function OnBrowseModelsDir
-    ${NSD_GetText} $ServerModelsDirBox $0
-    nsDialogs::SelectFolderDialog "Select the folder where your .gguf / .safetensors model files are stored" "$0"
-    Pop $0
-    ${If} $0 != error
-        ${NSD_SetText} $ServerModelsDirBox "$0"
-    ${EndIf}
-FunctionEnd
-
-Function ServerConfigPageLeave
-    ${NSD_GetText} $ServerPortBox      $ServerPort
-    ${NSD_GetText} $ServerThreadsBox   $ServerThreads
-    ${NSD_GetText} $ServerModelsDirBox $ServerModelsDir
-    ${NSD_GetState} $ServerAllRadio $0
-    ${If} $0 = ${BST_CHECKED}
-        StrCpy $ServerHostname "0.0.0.0"
-    ${Else}
-        StrCpy $ServerHostname "localhost"
-    ${EndIf}
-FunctionEnd
-
 ; ── Section descriptions ────────────────────────────────────────────
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-    !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "Core stable-diffusion.cpp executables and runtime scripts."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "Core stable-diffusion.cpp executables (sd-server, sd-config) and runtime scripts."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecPath} "Add stable-diffusion.cpp bin directory to system PATH."
-    !insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Start Menu shortcuts: stable-diffusion.cpp, Configure model / sd-server."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Start Menu shortcuts: launcher and GUI configurator."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ── Uninstaller ─────────────────────────────────────────────────────
@@ -301,11 +183,8 @@ Section "Uninstall"
     ; Files
     RMDir /r "$INSTDIR\bin"
     Delete "$INSTDIR\run-server.ps1"
-    Delete "$INSTDIR\config-model.ps1"
-    Delete "$INSTDIR\config-server.ps1"
     Delete "$INSTDIR\common-functions.ps1"
     Delete "$INSTDIR\mcp-server.ps1"
-    Delete "$INSTDIR\mcp-config.template.json"
     Delete "$INSTDIR\stable-diffusion.ico"
     Delete "$INSTDIR\uninstall.exe"
     RMDir "$INSTDIR"

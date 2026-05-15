@@ -3,8 +3,8 @@
 #
 # config-build.psd1 holds build-time settings only (paths, GPU backend toggles).
 # Runtime / per-model settings live under %LOCALAPPDATA%\stable-diffusion.cpp\config\
-# and are written by resources\config-server.ps1 and resources\config-model.ps1
-# on first launch (or via the NSIS install-time page).
+# and are written by the sd-config GUI / CLI (sd-config\target\release\sd-config.exe)
+# on first launch, or any time later via the "Configure" Start Menu shortcut.
 
 param(
     [string]$StableDiffusionCppDir  # path to sd.cpp source. If omitted, defaults to .\build\stable-diffusion.cpp

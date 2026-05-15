@@ -3,7 +3,7 @@
 # Dev convenience: lets you iterate on the runtime PowerShell scripts in this
 # repo and push them straight into the NSIS-installed copy under Program Files
 # without rebuilding / reinstalling. Binaries (sd-server.exe + ggml DLLs) are
-# NOT touched — re-run 02-build.ps1 + the installer for those.
+# NOT touched — re-run 02-build-server.ps1 + the installer for those.
 #
 # Resolves the target directory from HKLM\Software\stable-diffusion.cpp's
 # InstallDir (set by the NSIS installer), falling back to
@@ -50,15 +50,12 @@ if (-not $isAdmin) {
     exit $proc.ExitCode
 }
 
-# ── File list (mirrors 03-package.ps1 staging, minus the bin\ tree) ──
+# ── File list (mirrors 04-package.ps1 staging, minus the bin\ tree) ──
 $resources = Join-Path $PSScriptRoot 'resources'
 $files = @(
     'run-server.ps1'
-    'config-model.ps1'
-    'config-server.ps1'
     'common-functions.ps1'
     'mcp-server.ps1'
-    'mcp-config.template.json'
     'stable-diffusion.ico'
 )
 

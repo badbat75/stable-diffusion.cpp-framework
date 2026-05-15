@@ -1,0 +1,39 @@
+[package]
+name = "sd-config"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "GUI + CLI configurator for stable-diffusion.cpp (sd-server, presets, MCP clients)"
+publish = false
+
+[[bin]]
+name = "sd-config"
+path = "src/main.rs"
+
+[dependencies]
+slint = { version = "1.10", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility", "unstable-winit-030"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+dirs = "5"
+rfd = { version = "0.14", default-features = false, features = ["common-controls-v6"] }
+ico = "0.4"
+if-addrs = "0.13"
+
+[build-dependencies]
+slint-build = "1.10"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# A bare `cargo build` from the repo root would pick up the workspace
+# discovery walk and complain about this not being part of a workspace —
+# declare an empty workspace so the crate stands alone.
+[workspace]

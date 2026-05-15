@@ -8,8 +8,8 @@
 #   %LOCALAPPDATA%\stable-diffusion.cpp\config\server.ini    — machine-wide params
 #   %LOCALAPPDATA%\stable-diffusion.cpp\config\presets.ini   — per-model presets
 #
-# presets.ini is the source of truth — hand-edit it freely; config-model.ps1
-# updates one section at a time while preserving the rest of the file.
+# presets.ini is the source of truth — hand-edit it freely; sd-config rewrites
+# one section at a time while preserving the rest of the file.
 #
 # Unlike llama-server, sd-server loads ONE model set per process, so the
 # launcher prompts the user to pick a preset when more than one is configured
@@ -68,7 +68,12 @@ if (Test-Path $statePath) {
 
 # ── server.ini ───────────────────────────────────────────────────────
 if (-not (Test-Path $serverPath)) {
-    & (Join-Path $installDir "config-server.ps1")
+    $sdConfig = Join-Path $installDir "bin\sd-config.exe"
+    if (-not (Test-Path $sdConfig)) {
+        throw "server.ini missing and sd-config.exe not found at $sdConfig. Reinstall the package, or run 'sd-config server set ...' once cargo-built."
+    }
+    Write-Host "server.ini missing — launching sd-config (close it once configured)..." -ForegroundColor Cyan
+    Start-Process -FilePath $sdConfig -Wait
     if (-not (Test-Path $serverPath)) { throw "server.ini was not created. Aborting." }
 }
 $srvRaw = Read-ServerIni -Path $serverPath
@@ -85,8 +90,12 @@ $srv = @{
 $hasPresets = (Test-Path $presetsPath) -and `
               ([regex]::IsMatch((Get-Content -Path $presetsPath -Raw -Encoding UTF8), '(?m)^\['))
 if (-not $hasPresets) {
-    Write-Host "No model presets found — launching config-model.ps1..." -ForegroundColor Cyan
-    & (Join-Path $installDir "config-model.ps1")
+    $sdConfig = Join-Path $installDir "bin\sd-config.exe"
+    if (-not (Test-Path $sdConfig)) {
+        throw "No presets configured and sd-config.exe not found. Reinstall the package."
+    }
+    Write-Host "No model presets found — launching sd-config (add one and close to continue)..." -ForegroundColor Cyan
+    Start-Process -FilePath $sdConfig -Wait
     $hasPresets = (Test-Path $presetsPath) -and `
                   ([regex]::IsMatch((Get-Content -Path $presetsPath -Raw -Encoding UTF8), '(?m)^\['))
     if (-not $hasPresets) { throw "No model presets configured. Aborting." }
@@ -182,14 +191,17 @@ try {
 $hostname = if ($srv.Hostname)          { $srv.Hostname } else { 'localhost' }
 $port     = if ($null -ne $srv.Port)    { $srv.Port }     else { 1234 }
 
-$listenIp = if ($hostname -eq '0.0.0.0') { '0.0.0.0' } else { '127.0.0.1' }
+# sd-config writes either "localhost" (loopback-only) or a literal IP
+# (0.0.0.0 for all interfaces, or a specific adapter address). Pass IPs
+# through verbatim; only the "localhost" alias maps to 127.0.0.1.
+$listenIp = if ($hostname -eq 'localhost') { '127.0.0.1' } else { $hostname }
 
 $serverArgs = @(
     '--listen-ip',   $listenIp
     '--listen-port', $port
 )
 
-# Map preset keys (config-model.ps1's INI vocabulary) onto sd-server's CLI
+# Map preset keys (sd-config's presets.ini vocabulary) onto sd-server's CLI
 # flags. Keys not present in $active.Keys are skipped; boolean-true keys
 # become bare flags; everything else becomes `--key value`.
 $keys = $active.Keys

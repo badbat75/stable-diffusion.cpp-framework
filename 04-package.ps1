@@ -1,5 +1,5 @@
 # Package stable-diffusion.cpp binaries into an NSIS installer.
-# Requires: a successful build (02-build.ps1) and NSIS.
+# Requires: a successful build (02-build-server.ps1) and NSIS.
 
 . "$PSScriptRoot\common.ps1"  # loads $cfg, adds ROCm to PATH
 Enable-VsDevShell             # cmake --install needs the VS env
@@ -60,15 +60,24 @@ New-Item -ItemType Directory -Path $stageBin -Force | Out-Null
 # Copy everything in the build's bin\ directory (exe + ggml backend DLLs).
 Copy-Item "$srcBin\*" -Destination $stageBin -Recurse -Force
 
+# ── sd-config GUI/CLI binary ────────────────────────────────────────
+# Build it lazily if missing (mirrors how we treat sd-server.exe).
+$sdConfigExe = Join-Path $PSScriptRoot "sd-config\target\release\sd-config.exe"
+if (-not (Test-Path $sdConfigExe)) {
+    Write-Host "sd-config.exe not built yet — invoking 03-build-gui.ps1..." -ForegroundColor Cyan
+    & "$PSScriptRoot\03-build-gui.ps1"
+    if ($LASTEXITCODE -ne 0) { throw "03-build-gui.ps1 failed (exit $LASTEXITCODE)" }
+}
+if (-not (Test-Path $sdConfigExe)) { throw "sd-config.exe still missing after 03-build-gui.ps1: $sdConfigExe" }
+Copy-Item $sdConfigExe -Destination $stageBin -Force
+Write-Host "Staged sd-config.exe" -ForegroundColor Cyan
+
 # Stage runtime scripts and icon. All staged flat in $stageDir — NSIS template
 # installs them into $INSTDIR side-by-side, and run-server.ps1 invokes the
 # config writers via $installDir\config-*.ps1 (flat lookup, no subdir).
 Copy-Item "$PSScriptRoot\resources\run-server.ps1"          -Destination $stageDir -Force
-Copy-Item "$PSScriptRoot\resources\config-model.ps1"        -Destination $stageDir -Force
-Copy-Item "$PSScriptRoot\resources\config-server.ps1"       -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\common-functions.ps1"    -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\mcp-server.ps1"          -Destination $stageDir -Force
-Copy-Item "$PSScriptRoot\resources\mcp-config.template.json" -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\stable-diffusion.ico"    -Destination $stageDir -Force
 
 # ── Generate .nsi from template ─────────────────────────────────────

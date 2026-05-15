@@ -182,8 +182,8 @@ if (-not $cfg) {
     Write-Host "  Next: .\01-configure.ps1   # detect paths and generate build\config-build.psd1" -ForegroundColor Cyan
 } elseif ($rebuildSd) {
     Write-Host "  Recommended actions:" -ForegroundColor Yellow
-    Write-Host "    .\02-build.ps1            # stable-diffusion.cpp source updated" -ForegroundColor Yellow
-    Write-Host "    .\03-package.ps1          # rebuild installer afterwards" -ForegroundColor Yellow
+    Write-Host "    .\02-build-server.ps1     # stable-diffusion.cpp source updated" -ForegroundColor Yellow
+    Write-Host "    .\04-package.ps1          # rebuild installer afterwards" -ForegroundColor Yellow
 } else {
     Write-Host "  Toolchain up to date." -ForegroundColor Green
 }

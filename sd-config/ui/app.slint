@@ -1,0 +1,580 @@
+// stable-diffusion.cpp configurator — Slint UI.
+//
+// Three tabs (Server / Models / MCP) backed by the same INI/JSON files the
+// PowerShell scripts write (server.ini, presets.ini, ~/.claude.json, etc.).
+//
+// Slint can't bind a `let` in a callback body, so file-picker callbacks take
+// the current value and return the new value (= the dialog result, or the
+// passed-in current value if the user cancelled). Optional numeric fields are
+// typed as `string` to allow blank/unset.
+
+import {
+    TabWidget, VerticalBox, HorizontalBox, GroupBox, GridBox,
+    Button, LineEdit, ComboBox, CheckBox, ListView, ScrollView, Palette
+} from "std-widgets.slint";
+
+export struct McpClient {
+    id: string,
+    label: string,
+    config_path: string,
+    installed: bool,
+    note: string,
+}
+
+export struct PresetSummary {
+    id: string,
+    model: string,
+    model_type: string,
+}
+
+// Form-state of the currently edited preset. Mirrors the keys
+// the renderer in presets.rs writes into presets.ini.
+export struct PresetForm {
+    id: string,
+    model: string,
+    model_type: string,
+    vae: string,
+    llm: string,
+    t5xxl: string,
+    clip_l: string,
+    clip_g: string,
+    lora_dir: string,
+    embd_dir: string,
+    weight_type: string,
+    offload_to_cpu: bool,
+    mmap: bool,
+    fa: bool,
+    diffusion_fa: bool,
+    clip_on_cpu: bool,
+    vae_on_cpu: bool,
+    vae_tiling: bool,
+    max_vram: string,
+    sampler: string,
+    steps: int,
+    cfg_scale: string,
+    guidance: string,
+    width: int,
+    height: int,
+}
+
+component LabeledField inherits HorizontalBox {
+    in property <string> label;
+    in property <length> label_width: 130px;
+    spacing: 8px;
+    alignment: stretch;
+    Text {
+        text: root.label;
+        vertical-alignment: center;
+        width: root.label_width;
+    }
+    @children
+}
+
+export component AppWindow inherits Window {
+    title: "stable-diffusion.cpp configurator";
+    icon: window_icon;
+    min-width: 820px;
+    min-height: 620px;
+    preferred-width: 980px;
+    preferred-height: 720px;
+
+    // Set from Rust at startup (gui::set_window_icon) — decoded out of the
+    // .ico embedded by build.rs. Slint's compile-time @image-url doesn't
+    // handle .ico, so we go through the runtime image crate instead.
+    in property <image> window_icon;
+
+    // ── Server tab state ─────────────────────────────────────────────
+    in-out property <string> server_port: "1234";
+    // "localhost" | "0.0.0.0" | a specific interface IP (e.g. "192.168.1.10").
+    // The picker exposes localhost, 0.0.0.0, and one row per detected IPv4
+    // interface; `bind_labels` is the human-readable list (with iface name +
+    // CIDR), `bind_values` is the corresponding hostname strings, and
+    // `bind_index` is what the ComboBox uses to track the current selection.
+    in-out property <string> server_hostname: "localhost";
+    in-out property <[string]> bind_labels;
+    in-out property <[string]> bind_values;
+    in-out property <int> bind_index: 0;
+    in-out property <string> server_threads: "";
+    in-out property <string> server_models_dir: "";
+
+    // ── Models tab state ─────────────────────────────────────────────
+    in-out property <[PresetSummary]> presets;
+    in-out property <int> selected_preset_index: -1;
+    in-out property <PresetForm> form;
+    in-out property <string> presets_path: "";
+
+    // ── MCP tab state ────────────────────────────────────────────────
+    in-out property <[McpClient]> mcp_clients;
+
+    // ── Status / toast ───────────────────────────────────────────────
+    in-out property <string> status_text: "";
+    in-out property <bool> status_is_error: false;
+
+    // ── Callbacks (Rust side) ───────────────────────────────────────
+    callback save_server();
+    // pass current value; returns dialog result or the same value on cancel
+    callback browse_models_dir(string) -> string;
+
+    callback select_preset(int);
+    callback save_preset();
+    callback delete_preset(string);
+    callback new_preset();
+    callback browse_path(string, string) -> string;   // (field_id, current) -> new
+    callback browse_dir(string, string) -> string;
+
+    callback mcp_install(string);
+    callback mcp_uninstall(string);
+    callback mcp_refresh();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        TabWidget {
+            // ─────────────── Tab 1: Server ───────────────
+            Tab {
+                title: "Server";
+                ScrollView {
+                    VerticalBox {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        Text {
+                            text: "Machine-wide sd-server settings (server.ini)";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Per-model knobs live in the Models tab. Re-runnable any time.";
+                            color: Palette.foreground.transparentize(0.4);
+                            wrap: word-wrap;
+                        }
+
+                        GroupBox {
+                            title: "Network";
+                            VerticalBox {
+                                spacing: 8px;
+                                LabeledField {
+                                    label: "Port";
+                                    LineEdit {
+                                        text: root.server_port;
+                                        input-type: number;
+                                        placeholder-text: "1234";
+                                        edited(t) => { root.server_port = t; }
+                                    }
+                                }
+                                LabeledField {
+                                    label: "Bind to";
+                                    ComboBox {
+                                        model: root.bind_labels;
+                                        current-index: root.bind_index;
+                                        selected(value) => {
+                                            root.bind_index = self.current-index;
+                                            if (self.current-index >= 0 && self.current-index < root.bind_values.length) {
+                                                root.server_hostname = root.bind_values[self.current-index];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Resources";
+                            VerticalBox {
+                                spacing: 8px;
+                                LabeledField {
+                                    label: "CPU threads";
+                                    LineEdit {
+                                        text: root.server_threads;
+                                        input-type: number;
+                                        placeholder-text: "blank = sd-server picks physical-core count";
+                                        edited(t) => { root.server_threads = t; }
+                                    }
+                                }
+                                LabeledField {
+                                    label: "Models folder";
+                                    LineEdit {
+                                        text: root.server_models_dir;
+                                        placeholder-text: "where your .gguf / .safetensors files live";
+                                        edited(t) => { root.server_models_dir = t; }
+                                    }
+                                    Button {
+                                        text: "Browse…";
+                                        clicked => {
+                                            root.server_models_dir = root.browse_models_dir(root.server_models_dir);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalBox {
+                            alignment: end;
+                            spacing: 8px;
+                            Button {
+                                text: "Save server.ini";
+                                primary: true;
+                                clicked => { root.save_server(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ─────────────── Tab 2: Models / presets ───────────────
+            Tab {
+                title: "Models";
+                HorizontalBox {
+                    padding: 12px;
+                    spacing: 12px;
+
+                    // Left column: preset list
+                    VerticalBox {
+                        width: 240px;
+                        spacing: 8px;
+                        Text {
+                            text: "Presets";
+                            font-size: 14px;
+                            font-weight: 700;
+                        }
+                        Rectangle {
+                            border-width: 1px;
+                            border-color: Palette.border;
+                            border-radius: 4px;
+                            background: Palette.alternate-background;
+                            min-height: 240px;
+                            ListView {
+                                for p[i] in root.presets : Rectangle {
+                                    height: 36px;
+                                    background: i == root.selected_preset_index
+                                        ? Palette.accent-background
+                                        : transparent;
+                                    HorizontalBox {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        Text {
+                                            text: p.id;
+                                            color: i == root.selected_preset_index ? Palette.accent-foreground : Palette.foreground;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    TouchArea {
+                                        clicked => { root.select_preset(i); }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalBox {
+                            spacing: 6px;
+                            Button {
+                                text: "New…";
+                                clicked => { root.new_preset(); }
+                            }
+                            Button {
+                                text: "Delete";
+                                enabled: root.selected_preset_index >= 0;
+                                clicked => { root.delete_preset(root.form.id); }
+                            }
+                        }
+                        Text {
+                            text: root.presets_path;
+                            font-size: 10px;
+                            color: Palette.foreground.transparentize(0.5);
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    // Right column: editor
+                    ScrollView {
+                        horizontal-stretch: 1;
+                        VerticalBox {
+                            padding: 4px;
+                            spacing: 10px;
+
+                            Text {
+                                text: root.selected_preset_index >= 0
+                                    ? "Preset id: " + root.form.id
+                                    : "Select a preset on the left, or click New…";
+                                font-size: 14px;
+                                font-weight: 700;
+                            }
+
+                            GroupBox {
+                                title: "Model";
+                                VerticalBox {
+                                    spacing: 6px;
+                                    LabeledField {
+                                        label: "Type";
+                                        ComboBox {
+                                            model: ["standalone (Flux/SD3/Wan/Qwen…)", "allinone (SD1.x/SDXL bundle)"];
+                                            current-index: root.form.model_type == "allinone" ? 1 : 0;
+                                            selected(value) => {
+                                                root.form.model_type = self.current-index == 1 ? "allinone" : "standalone";
+                                            }
+                                        }
+                                    }
+                                    LabeledField {
+                                        label: "File";
+                                        LineEdit {
+                                            text: root.form.model;
+                                            edited(t) => { root.form.model = t; }
+                                        }
+                                        Button {
+                                            text: "…";
+                                            clicked => {
+                                                root.form.model = root.browse_path("model", root.form.model);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            GroupBox {
+                                title: "Sub-model paths (only what the architecture needs)";
+                                VerticalBox {
+                                    spacing: 6px;
+
+                                    LabeledField {
+                                        label: "VAE";
+                                        LineEdit { text: root.form.vae; edited(t) => { root.form.vae = t; } }
+                                        Button { text: "…"; clicked => { root.form.vae = root.browse_path("vae", root.form.vae); } }
+                                    }
+                                    LabeledField {
+                                        label: "LLM";
+                                        LineEdit { text: root.form.llm; edited(t) => { root.form.llm = t; } }
+                                        Button { text: "…"; clicked => { root.form.llm = root.browse_path("llm", root.form.llm); } }
+                                    }
+                                    LabeledField {
+                                        label: "T5-XXL";
+                                        LineEdit { text: root.form.t5xxl; edited(t) => { root.form.t5xxl = t; } }
+                                        Button { text: "…"; clicked => { root.form.t5xxl = root.browse_path("t5xxl", root.form.t5xxl); } }
+                                    }
+                                    LabeledField {
+                                        label: "CLIP-L";
+                                        LineEdit { text: root.form.clip_l; edited(t) => { root.form.clip_l = t; } }
+                                        Button { text: "…"; clicked => { root.form.clip_l = root.browse_path("clip_l", root.form.clip_l); } }
+                                    }
+                                    LabeledField {
+                                        label: "CLIP-G";
+                                        LineEdit { text: root.form.clip_g; edited(t) => { root.form.clip_g = t; } }
+                                        Button { text: "…"; clicked => { root.form.clip_g = root.browse_path("clip_g", root.form.clip_g); } }
+                                    }
+                                    LabeledField {
+                                        label: "LoRA dir";
+                                        LineEdit { text: root.form.lora_dir; edited(t) => { root.form.lora_dir = t; } }
+                                        Button { text: "…"; clicked => { root.form.lora_dir = root.browse_dir("lora_dir", root.form.lora_dir); } }
+                                    }
+                                    LabeledField {
+                                        label: "Embed dir";
+                                        LineEdit { text: root.form.embd_dir; edited(t) => { root.form.embd_dir = t; } }
+                                        Button { text: "…"; clicked => { root.form.embd_dir = root.browse_dir("embd_dir", root.form.embd_dir); } }
+                                    }
+                                }
+                            }
+
+                            GroupBox {
+                                title: "Memory / performance";
+                                VerticalBox {
+                                    spacing: 6px;
+                                    LabeledField {
+                                        label: "Weight type";
+                                        ComboBox {
+                                            model: ["", "f32", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_K", "q3_K", "q4_K"];
+                                            current-value: root.form.weight_type;
+                                            selected(value) => { root.form.weight_type = value; }
+                                        }
+                                    }
+                                    LabeledField {
+                                        label: "Max VRAM (GiB)";
+                                        LineEdit {
+                                            text: root.form.max_vram;
+                                            placeholder-text: "blank = unlimited";
+                                            edited(t) => { root.form.max_vram = t; }
+                                        }
+                                    }
+                                    HorizontalBox {
+                                        spacing: 16px;
+                                        CheckBox { text: "offload-to-cpu"; checked: root.form.offload_to_cpu; toggled => { root.form.offload_to_cpu = self.checked; } }
+                                        CheckBox { text: "mmap";           checked: root.form.mmap;           toggled => { root.form.mmap = self.checked; } }
+                                        CheckBox { text: "fa";             checked: root.form.fa;             toggled => { root.form.fa = self.checked; } }
+                                        CheckBox { text: "diffusion-fa";   checked: root.form.diffusion_fa;   toggled => { root.form.diffusion_fa = self.checked; } }
+                                    }
+                                    HorizontalBox {
+                                        spacing: 16px;
+                                        CheckBox { text: "clip-on-cpu";    checked: root.form.clip_on_cpu;    toggled => { root.form.clip_on_cpu = self.checked; } }
+                                        CheckBox { text: "vae-on-cpu";     checked: root.form.vae_on_cpu;     toggled => { root.form.vae_on_cpu = self.checked; } }
+                                        CheckBox { text: "vae-tiling";     checked: root.form.vae_tiling;     toggled => { root.form.vae_tiling = self.checked; } }
+                                    }
+                                }
+                            }
+
+                            GroupBox {
+                                title: "Default generation parameters";
+                                VerticalBox {
+                                    spacing: 6px;
+                                    LabeledField {
+                                        label: "Sampler";
+                                        ComboBox {
+                                            model: ["euler_a","euler","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","lcm","ipndm","ipndm_v","ddim_trailing","tcd"];
+                                            current-value: root.form.sampler == "" ? "euler_a" : root.form.sampler;
+                                            selected(value) => { root.form.sampler = value; }
+                                        }
+                                    }
+                                    LabeledField {
+                                        label: "Steps";
+                                        LineEdit {
+                                            text: "\{root.form.steps}";
+                                            input-type: number;
+                                            edited(t) => { root.form.steps = t.to-float(); }
+                                        }
+                                    }
+                                    LabeledField {
+                                        label: "CFG scale";
+                                        LineEdit {
+                                            text: root.form.cfg_scale;
+                                            edited(t) => { root.form.cfg_scale = t; }
+                                        }
+                                    }
+                                    LabeledField {
+                                        label: "Guidance";
+                                        LineEdit {
+                                            text: root.form.guidance;
+                                            placeholder-text: "Flux/Flux2 only (default 3.5); blank = unset";
+                                            edited(t) => { root.form.guidance = t; }
+                                        }
+                                    }
+                                    HorizontalBox {
+                                        spacing: 12px;
+                                        LabeledField {
+                                            label: "Width";
+                                            LineEdit {
+                                                text: "\{root.form.width}";
+                                                input-type: number;
+                                                edited(t) => { root.form.width = t.to-float(); }
+                                            }
+                                        }
+                                        LabeledField {
+                                            label: "Height";
+                                            LineEdit {
+                                                text: "\{root.form.height}";
+                                                input-type: number;
+                                                edited(t) => { root.form.height = t.to-float(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalBox {
+                                alignment: end;
+                                Button {
+                                    text: "Save preset";
+                                    primary: true;
+                                    enabled: root.selected_preset_index >= 0 && root.form.id != "";
+                                    clicked => { root.save_preset(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ─────────────── Tab 3: MCP clients ───────────────
+            Tab {
+                title: "MCP";
+                ScrollView {
+                    VerticalBox {
+                        padding: 16px;
+                        spacing: 12px;
+
+                        Text {
+                            text: "Register the stable-diffusion.cpp MCP server with your AI client";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Adds a `stable-diffusion-cpp` entry pointing at mcp-server.ps1 so the client can call generate_image, list_presets, switch_preset, etc. Other entries in your existing config are left untouched.";
+                            color: Palette.foreground.transparentize(0.4);
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalBox {
+                            alignment: end;
+                            Button {
+                                text: "Re-detect";
+                                clicked => { root.mcp_refresh(); }
+                            }
+                        }
+
+                        for c in root.mcp_clients : Rectangle {
+                            border-width: 1px;
+                            border-color: Palette.border;
+                            border-radius: 6px;
+                            background: Palette.alternate-background;
+                            VerticalBox {
+                                padding: 12px;
+                                spacing: 6px;
+                                HorizontalBox {
+                                    alignment: space-between;
+                                    Text {
+                                        text: c.label;
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: c.installed ? "✓ installed" : "not installed";
+                                        color: c.installed ? #2e7d32 : Palette.foreground.transparentize(0.4);
+                                    }
+                                }
+                                Text {
+                                    text: c.config_path;
+                                    font-size: 11px;
+                                    color: Palette.foreground.transparentize(0.5);
+                                    wrap: word-wrap;
+                                }
+                                if c.note != "" : Text {
+                                    text: c.note;
+                                    font-size: 11px;
+                                    color: #c62828;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        text: c.installed ? "Reinstall" : "Install";
+                                        primary: !c.installed;
+                                        clicked => { root.mcp_install(c.id); }
+                                    }
+                                    Button {
+                                        text: "Uninstall";
+                                        enabled: c.installed;
+                                        clicked => { root.mcp_uninstall(c.id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Status bar
+        if root.status_text != "" : Rectangle {
+            background: root.status_is_error ? #c6282822 : Palette.alternate-background;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: root.status_is_error ? #c62828 : Palette.border;
+            height: status_text.preferred-height + 16px;
+            status_text := Text {
+                x: 8px;
+                width: parent.width - 16px;
+                text: root.status_text;
+                color: root.status_is_error ? #c62828 : Palette.foreground;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
