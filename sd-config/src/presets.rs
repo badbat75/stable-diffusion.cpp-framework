@@ -67,7 +67,7 @@ impl Default for Preset {
             vae_on_cpu: None,
             vae_tiling: None,
             max_vram: None,
-            sampler: "euler_a".into(),
+            sampler: "euler".into(),
             steps: Some(20),
             cfg_scale: Some(7.0),
             guidance: None,

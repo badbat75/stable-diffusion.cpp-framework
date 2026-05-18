@@ -786,7 +786,7 @@ export component AppWindow inherits Window {
                                     label: "Sampler";
                                     ComboBox {
                                         model: ["euler_a","euler","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","lcm","ipndm","ipndm_v","ddim_trailing","tcd"];
-                                        current-value: root.form.sampler == "" ? "euler_a" : root.form.sampler;
+                                        current-value: root.form.sampler == "" ? "euler" : root.form.sampler;
                                         selected(value) => { root.form.sampler = value; }
                                     }
                                 }

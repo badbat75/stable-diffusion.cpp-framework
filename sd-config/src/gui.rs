@@ -841,7 +841,7 @@ fn preset_to_form(p: &presets::Preset) -> PresetForm {
         vae_on_cpu: p.vae_on_cpu.unwrap_or(false),
         vae_tiling: p.vae_tiling.unwrap_or(false),
         max_vram: p.max_vram.map(|v| v.to_string()).unwrap_or_default().into(),
-        sampler: if p.sampler.is_empty() { "euler_a".into() } else { p.sampler.clone().into() },
+        sampler: if p.sampler.is_empty() { "euler".into() } else { p.sampler.clone().into() },
         steps: p.steps.unwrap_or(20),
         cfg_scale: p.cfg_scale.map(|v| v.to_string()).unwrap_or_else(|| "7".into()).into(),
         guidance: p.guidance.map(|v| v.to_string()).unwrap_or_default().into(),
