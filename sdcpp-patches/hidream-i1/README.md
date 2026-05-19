@@ -34,9 +34,13 @@ forking upstream. Layered on by `..\patch-lib.ps1` on every build.
 > `n_token`. Verified: CLIP-L pooled cos **0.032→0.99998**, pooled total
 > **0.72→0.95** (memory `hidream-i1-clip-l-pooled-fix`). Needs a
 > projection-bearing 248-pos CLIP-L at runtime to take effect. Separate:
-> the pure-**white image** was root-caused to **flash attention** (preset
-> `fa`/`diffusion-fa`=true → NaN in HiDream attention; config fix, not code —
-> memory `hidream-i1-white-image-regression`); a defensive `real_len==0`
+> the pure-**white image** was root-caused to an **F16 overflow in the
+> flash-attention QK^T** (HiDream's full-dim learned-weight RMSNorm q/k);
+> fixed at source via `kv_scale=1/128` in `JointAttention` (commit d90fcb8,
+> mirrors z_image.hpp). FA-on+kv_scale is the correct & faster path and also
+> resolves the FA-off-path "solarisation"; the earlier blanket `fa=false`
+> workaround was reverted (memory `hidream-i1-white-image-regression`). A
+> defensive `real_len==0`
 > causal-only mask safeguard (HF `_unmask_unattended` equiv) was added to
 > `hidream_i1.hpp`. Residual minor item (NOT the gap): pad-position hidden
 > states ~2.9×. `wiring.patch` (now also `src/clip.hpp`) vs `8308042`

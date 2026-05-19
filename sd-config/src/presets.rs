@@ -79,19 +79,13 @@ impl Default for Preset {
 
 impl Preset {
     pub fn new_default(id: String, model: String, model_type: String) -> Self {
-        let mut p = Self { id, model, model_type, ..Default::default() };
-        // HiDream-I1's attention (MMDiT + MoE) NaNs under the flash-attention
-        // path in sd.cpp -> a pure-white (all-255) image. Default HiDream-I1
-        // presets with flash attention OFF. Note: `--fa` enables flash
-        // attention in the diffusion model too, so BOTH must be false (a
-        // bare `diffusion-fa=false` with `fa=true` is still white). Verified
-        // 2026-05-19; see project memory `hidream-i1-white-image-regression`.
-        let m = p.model.to_lowercase();
-        if m.contains("hidream") && m.contains("i1") {
-            p.fa = Some(false);
-            p.diffusion_fa = Some(false);
-        }
-        p
+        // HiDream-I1 follows the normal default (flash attention ON). The
+        // earlier HiDream-I1 fa=false special-case was a workaround for a
+        // pure-white image that was actually an F16 overflow in the flash
+        // attention QK^T; it is fixed at the source (kv_scale=1/128 in the
+        // sdcpp-patches/hidream-i1 JointAttention), so FA is the correct and
+        // faster path. See memory `hidream-i1-white-image-regression`.
+        Self { id, model, model_type, ..Default::default() }
     }
 
     fn from_keys(id: &str, k: &std::collections::BTreeMap<String, String>) -> Self {
