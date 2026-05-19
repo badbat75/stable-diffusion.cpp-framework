@@ -1087,13 +1087,14 @@ namespace HiDreamI1 {
             if (clip_l) {
                 auto toks = clip_l_tokenizer.encode(cp.text, on_tok);
                 // CLIP forward asserts input_ids->ne[0] == position_embedding
-                // length (clip.hpp:167) — an EXACT match, not <=. min_length
-                // must therefore equal the model's 77-pos window; the earlier
-                // min_length=0 left tokens unpadded (~9) and tripped the
-                // assert. 77,77,true mirrors the upstream SD3/Flux CLIP-L/G
-                // contract (conditioner.hpp:1246). clip_l/clip_g GGUF here are
-                // standard 77-pos (verified), not the long-248 variant.
-                clip_l_tokenizer.pad_tokens(toks, nullptr, nullptr, 77, 77, true);
+                // length (clip.hpp:167) — an EXACT match, not <=. Pad to the
+                // model's OWN position window: HiDream-I1's CLIP-L is the
+                // long-context 248-pos CLIPTextModelWithProjection, whereas
+                // CLIP-G stays the standard 77. clip.hpp's init_params sets
+                // model.n_token from the checkpoint's position table, so this
+                // tracks whichever CLIP variant the user supplied.
+                const int clip_l_npos = clip_l->model.n_token;
+                clip_l_tokenizer.pad_tokens(toks, nullptr, nullptr, clip_l_npos, clip_l_npos, true);
                 sd::Tensor<int32_t> ids({(int64_t)toks.size()}, toks);
                 auto it     = std::find(toks.begin(), toks.end(), clip_l_tokenizer.EOS_TOKEN_ID);
                 size_t mtok = std::min<size_t>(std::distance(toks.begin(), it), toks.size() - 1);
@@ -1101,7 +1102,8 @@ namespace HiDreamI1 {
             }
             if (clip_g) {
                 auto toks = clip_g_tokenizer.encode(cp.text, on_tok);
-                clip_g_tokenizer.pad_tokens(toks, nullptr, nullptr, 77, 77, true);  // see clip_l note
+                const int clip_g_npos = clip_g->model.n_token;  // see clip_l note (normally 77)
+                clip_g_tokenizer.pad_tokens(toks, nullptr, nullptr, clip_g_npos, clip_g_npos, true);
                 sd::Tensor<int32_t> ids({(int64_t)toks.size()}, toks);
                 auto it     = std::find(toks.begin(), toks.end(), clip_g_tokenizer.EOS_TOKEN_ID);
                 size_t mtok = std::min<size_t>(std::distance(toks.begin(), it), toks.size() - 1);
@@ -1179,10 +1181,20 @@ namespace HiDreamI1 {
                            toks[(size_t)real_len - 1] == llama3_tok->PAD_TOKEN_ID) {
                         real_len--;
                     }
+                    // real_len==0 (an all-pad sequence, e.g. the empty
+                    // CFG-negative prompt with add_bos=false) would make every
+                    // (k>=real_len) true → an entire -INF row → softmax NaN →
+                    // NaN latent → pure-white image. HF avoids this via
+                    // AttentionMaskConverter._unmask_unattended (fully-masked
+                    // rows are left unmasked); sd.cpp has no such safeguard, so
+                    // mirror it: when there are no real tokens, fall back to a
+                    // causal-only mask (drop the pad-key term) so no row is
+                    // ever fully masked. Non-empty prompts are unaffected.
+                    const bool mask_pad_keys = real_len > 0;
                     std::vector<float> m((size_t)(n * n));
                     for (int64_t q = 0; q < n; q++) {
                         for (int64_t k = 0; k < n; k++) {
-                            bool masked = (k > q) || (k >= real_len);
+                            bool masked = (k > q) || (mask_pad_keys && k >= real_len);
                             m[(size_t)(q * n + k)] = masked ? -INFINITY : 0.f;
                         }
                     }

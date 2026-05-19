@@ -537,3 +537,66 @@ index bb04efb..aed3e2b 100644
      sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
      if (sd_ctx == nullptr) {
          return nullptr;
+diff --git a/src/clip.hpp b/src/clip.hpp
+index a356732..36f1cce 100644
+--- a/src/clip.hpp
++++ b/src/clip.hpp
+@@ -137,7 +137,15 @@ protected:
+                 token_wtype = GGML_TYPE_F32;
+             }
+         }
+-        enum ggml_type position_wtype       = GGML_TYPE_F32;
++        enum ggml_type position_wtype = GGML_TYPE_F32;
++        // num_positions is data-driven from the checkpoint rather than the
++        // hardcoded 77: HiDream-I1's CLIP-L is a long-context (248-pos)
++        // CLIPTextModelWithProjection. Vanilla SD1.x/SDXL CLIP stays 77 (the
++        // checkpoint simply carries [embed_dim,77]) so this is a no-op there.
++        auto pit = tensor_storage_map.find(prefix + "position_embedding.weight");
++        if (pit != tensor_storage_map.end() && pit->second.n_dims >= 2 && pit->second.ne[1] > 0) {
++            num_positions = pit->second.ne[1];
++        }
+         params["token_embedding.weight"]    = ggml_new_tensor_2d(ctx, token_wtype, embed_dim, vocab_size);
+         params["position_embedding.weight"] = ggml_new_tensor_2d(ctx, position_wtype, embed_dim, num_positions);
+     }
+@@ -250,9 +258,41 @@ enum CLIPVersion {
+ class CLIPTextModel : public GGMLBlock {
+ protected:
+     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
++        // Keep n_token in sync with the checkpoint's position table so the
++        // runner's input_ids reshape and downstream token padding match a
++        // long-context CLIP (HiDream-I1 CLIP-L = 248). No-op for 77-pos CLIP.
++        // Scan (not exact find): the loader's tensor-name conversion + the
++        // block-prefix separator vary, so match by suffix within this CLIP's
++        // scope.
++        for (const auto& kv : tensor_storage_map) {
++            if (starts_with(kv.first, prefix) &&
++                kv.first.find("embeddings.position_embedding.weight") != std::string::npos &&
++                kv.second.n_dims >= 2 && kv.second.ne[1] > 0) {
++                n_token = (int32_t)kv.second.ne[1];
++                break;
++            }
++        }
+         if (version == OPEN_CLIP_VIT_BIGG_14) {
+             enum ggml_type wtype      = GGML_TYPE_F32;
+             params["text_projection"] = ggml_new_tensor_2d(ctx, wtype, projection_dim, hidden_size);
++        } else if (version == OPENAI_CLIP_VIT_L_14) {
++            // HiDream-I1 loads CLIP-L as CLIPTextModelWithProjection: its
++            // pooled c_vector half is text_projection(last_hidden[eos]), a
++            // [768,768] bias-free Linear. Vanilla SDXL/SD1.x CLIP-L is a bare
++            // CLIPTextModel with NO text_projection -> declaring an unfilled
++            // param there would feed garbage into every non-HiDream CLIP-L
++            // pooled path, so gate strictly on the weight being present. The
++            // model loader rewrites the (sibling) text_projection.weight to
++            // "<...text_model>.text_projection"; match that scoped-by-prefix
++            // by substring so declaring it mirrors the proven BIGG path.
++            for (const auto& kv : tensor_storage_map) {
++                if (starts_with(kv.first, prefix) &&
++                    kv.first.find("text_projection") != std::string::npos) {
++                    enum ggml_type wtype      = GGML_TYPE_F32;
++                    params["text_projection"] = ggml_new_tensor_2d(ctx, wtype, hidden_size, hidden_size);
++                    break;
++                }
++            }
+         }
+     }
+ 

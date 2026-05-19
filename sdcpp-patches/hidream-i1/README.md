@@ -25,9 +25,22 @@ forking upstream. Layered on by `..\patch-lib.ps1` on every build.
 > orthogonal to the reference (cos 0.004). Fix (`add_bos_token=false`,
 > `PAD_TOKEN_ID=BOS_TOKEN_ID`): real-prompt-token Llama cos **0.40→0.995**,
 > ‖ratio‖→1.00 (see project memory `hidream-i1-llama-encoder-bug-measured`).
-> Residual minor items (NOT the gap): pad-position hidden states ~2.9× and
-> pooled/CLIP cos 0.72. `wiring.patch` (6 files, 17
-> hunks, 119+/1− vs `8308042`) carries: `LLMArch::LLAMA3` (`src/llm.hpp`);
+> Pooled gap ALSO fixed 2026-05-19: sd.cpp declared CLIP `text_projection`
+> only for BIGG (CLIP-G), and HiDream's CLIP-L is a long-context **248-pos**
+> `CLIPTextModelWithProjection` — sd.cpp hardcoded 77. `wiring.patch`'s new
+> `src/clip.hpp` hunk presence-gates a CLIP-L `text_projection` and makes CLIP
+> `num_positions`/`n_token` data-driven from the checkpoint (no-op for
+> vanilla 77-pos SDXL/SD1.x); `hidream_i1.hpp` pads CLIP-L to its native
+> `n_token`. Verified: CLIP-L pooled cos **0.032→0.99998**, pooled total
+> **0.72→0.95** (memory `hidream-i1-clip-l-pooled-fix`). Needs a
+> projection-bearing 248-pos CLIP-L at runtime to take effect. Separate:
+> the pure-**white image** was root-caused to **flash attention** (preset
+> `fa`/`diffusion-fa`=true → NaN in HiDream attention; config fix, not code —
+> memory `hidream-i1-white-image-regression`); a defensive `real_len==0`
+> causal-only mask safeguard (HF `_unmask_unattended` equiv) was added to
+> `hidream_i1.hpp`. Residual minor item (NOT the gap): pad-position hidden
+> states ~2.9×. `wiring.patch` (now also `src/clip.hpp`) vs `8308042`
+> carries: `LLMArch::LLAMA3` (`src/llm.hpp`);
 > `VERSION_HIDREAM_I1` detection + enum/string (`src/model.{h,cpp}`,
 > `src/stable-diffusion.cpp`); and the gated Step-4 wiring (`CMakeLists.txt`
 > option, `src/diffusion_model.hpp` wrapper + include + `DiffusionParams`
