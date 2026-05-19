@@ -311,7 +311,19 @@ namespace HiDreamI1 {
                 v       = ggml_concat(ctx->ggml_ctx, iv, tv, 2);
             }
 
-            auto attn = Rope::attention(ctx, q, k, v, pe, mask);  // [N, L, dim]
+            // kv_scale = 1/d_head (d_head = 2560/20 = 128): HiDream's q/k pass
+            // through a learned-weight RMSNorm over the full 2560-dim
+            // projection, giving larger magnitudes than Flux's per-head qk
+            // norm. ggml_ext_attention_ext's flash path casts k,v to F16, so
+            // at high resolution (long [img;txt] sequence) the F16 QK^T
+            // overflows -> NaN -> pure-white image (FA-on only; FA-off keeps
+            // F32 and is fine). The helper's kv_scale down-scales k,v before
+            // the F16 cast and compensates exactly (softmax scale/kv_scale,
+            // output x 1/kv_scale) -> mathematically transparent, only the
+            // F16 dynamic range changes. Mirrors the proven Z-Image DiT path
+            // (z_image.hpp uses the identical 1/128). Lets flash attention be
+            // used for HiDream-I1 without the white-image NaN.
+            auto attn = Rope::attention(ctx, q, k, v, pe, mask, 1.f / 128.f);  // [N, L, dim]
 
             ggml_tensor* img_out = attn;
             ggml_tensor* txt_out = nullptr;
