@@ -18,9 +18,15 @@ forking upstream. Layered on by `..\patch-lib.ps1` on every build.
 > `wiring.patch` growth**. Localisation used new dev hooks
 > `HIDREAM_I1_INJECT_COND` (gold-cond → real sampler isolation) +
 > `tools/{unpatchify_check,flow_dir_check}.py` (the latter is the smoking
-> gun: x₀+v₀ spatial-corr 0.978 vs sd.cpp's x₀−v₀ 0.03). Leftover
-> slightly-orange hue is a separate, documented conditioner-fidelity gap
-> (Q8 + ~0.49 llama norm + tokenizer), not structural. `wiring.patch` (6 files, 17
+> gun: x₀+v₀ spatial-corr 0.978 vs sd.cpp's x₀−v₀ 0.03). The
+> conditioner-fidelity gap (the "slightly-orange hue") was ROOT-CAUSED &
+> FIXED 2026-05-19: `llama3_tokenizer.hpp` mis-tokenised (spurious leading
+> BOS + wrong pad id) vs diffusers `tokenizer_4`, making the Llama embedding
+> orthogonal to the reference (cos 0.004). Fix (`add_bos_token=false`,
+> `PAD_TOKEN_ID=BOS_TOKEN_ID`): real-prompt-token Llama cos **0.40→0.995**,
+> ‖ratio‖→1.00 (see project memory `hidream-i1-llama-encoder-bug-measured`).
+> Residual minor items (NOT the gap): pad-position hidden states ~2.9× and
+> pooled/CLIP cos 0.72. `wiring.patch` (6 files, 17
 > hunks, 119+/1− vs `8308042`) carries: `LLMArch::LLAMA3` (`src/llm.hpp`);
 > `VERSION_HIDREAM_I1` detection + enum/string (`src/model.{h,cpp}`,
 > `src/stable-diffusion.cpp`); and the gated Step-4 wiring (`CMakeLists.txt`

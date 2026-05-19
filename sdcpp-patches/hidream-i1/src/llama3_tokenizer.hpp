@@ -48,22 +48,23 @@ public:
         //   tokenizer_4(prompt, padding="max_length", max_length=128,
         //               truncation=True, add_special_tokens=True)
         //   with tokenizer_4.pad_token = tokenizer_4.eos_token.
-        // Llama-3's fast tokenizer with add_special_tokens=True prepends BOS
-        // only (no trailing EOS, no chat template). pad_tokens() honours
-        // these two flags, so [BOS]+ids padded to 128 with PAD(=EOS) and
-        // truncated to 128 reproduces it byte-for-byte.
-        // Production-faithful: HiDream loads the real (gated)
-        // meta-llama-3.1-8B tokenizer, and diffusers calls it with
-        // add_special_tokens=True, which prepends BOS(128000) only (no EOS,
-        // no chat template — verified vs installed diffusers 0.38.0
-        // pipeline_hidream_image.py:_get_llama3_prompt_embeds).
-        // Task #9 bisection result (do NOT flip to match val/llama.bin):
-        // toggling this off moved llama cos only 0.39->0.49 (no clean
-        // 0.39->0.99 snap), so BOS is NOT the dominant divergence; the
-        // residual is the missing Llama-3.1 "llama3" RoPE rescaling
-        // (llm.hpp:677 FIDELITY TODO — monotonic per-layer cos decay
-        // blk1 0.66 -> blk32 0.06). Keep this production-faithful.
-        add_bos_token = true;
+        // MEASURED 2026-05-19 (the prior "prepends BOS / production-faithful /
+        // Task #9" comment here was WRONG — third stale comment found): a
+        // torch probe of the SAME GGUF via transformers AutoTokenizer (exactly
+        // what hidream_i1_ref.py --llama-gguf feeds, i.e. what generated the
+        // val/llama.bin oracle) emits for "a red cube on grass":
+        //   ids = [64,2579,24671,389,16763, 128000,128000,...]  (n_real=5)
+        // i.e. **NO leading BOS** (the GGUF-reconstructed fast tokenizer has
+        // add_bos disabled) and right-pad with **128000** (diffusers sets
+        // pad_token = eos_token, and this tokenizer's eos resolves to 128000
+        // == the GGUF bos id). sd.cpp previously prepended BOS at pos 0 and
+        // padded with GGUF eos (128009): every position shifted by one + a
+        // different pad id => embedding rows entirely different => sd-vs-ref
+        // embedding cos 0.004 (orthogonal) => the whole HiDream-I1
+        // conditioner-fidelity gap. Align to the measured contract: no BOS,
+        // pad with BOS_TOKEN_ID (=128000, what HF treats as eos here). See
+        // PAD_TOKEN_ID assignment below.
+        add_bos_token = false;
         add_eos_token = false;
 
         // Byte<->unicode map: identical to the one BPETokenizer::encode() uses
@@ -138,7 +139,12 @@ public:
         };
         BOS_TOKEN_ID = sid("tokenizer.ggml.bos_token_id", 128000);
         EOS_TOKEN_ID = sid("tokenizer.ggml.eos_token_id", 128001);
-        PAD_TOKEN_ID = EOS_TOKEN_ID;
+        // diffusers: tokenizer_4.pad_token = tokenizer_4.eos_token. For this
+        // GGUF-reconstructed HF tokenizer eos resolves to 128000 (== the GGUF
+        // bos id), NOT the GGUF eos metadata (128009) — measured against the
+        // val/llama.bin oracle (see add_bos_token note above). Pad with
+        // BOS_TOKEN_ID so sd.cpp's right-pad fill matches the reference.
+        PAD_TOKEN_ID = BOS_TOKEN_ID;
         UNK_TOKEN_ID = EOS_TOKEN_ID;
         if (decoder.count(BOS_TOKEN_ID)) {
             BOS_TOKEN = utf32_to_utf8(decoder[BOS_TOKEN_ID]);
