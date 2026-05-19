@@ -1,0 +1,5 @@
+# transient step-5 validation artefacts (regenerated on demand)
+val*/
+*.bin
+__pycache__/
+*.pyc

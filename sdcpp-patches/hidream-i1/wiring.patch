@@ -1,0 +1,539 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 89fb928..ec31a7e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -69,6 +69,7 @@ option(SD_MUSA                       "sd: musa backend" OFF)
+ option(SD_BUILD_SHARED_LIBS          "sd: build shared libs" OFF)
+ option(SD_BUILD_SHARED_GGML_LIB      "sd: build ggml as a separate shared lib" OFF)
+ option(SD_USE_SYSTEM_GGML            "sd: use system-installed GGML library" OFF)
++option(SD_HIDREAM_I1_EXPERIMENTAL    "sd: enable experimental HiDream-I1 support (not numerically validated)" OFF)
+ #option(SD_BUILD_SERVER               "sd: build server example"                           ON)
+ 
+ set(CMAKE_C_STANDARD 11)
+@@ -237,6 +238,14 @@ else()
+     add_library(${SD_LIB} STATIC ${SD_LIB_SOURCES})
+ endif()
+ 
++# Experimental HiDream-I1 (sdcpp-patches/hidream-i1). OFF by default so the
++# wiring.patch produces a byte-identical vanilla binary; opt in to test the
++# not-yet-numerically-validated path. See sdcpp-patches/hidream-i1/README.md.
++if(SD_HIDREAM_I1_EXPERIMENTAL)
++    message("-- HiDream-I1 experimental support: ENABLED (numerics unvalidated)")
++    target_compile_definitions(${SD_LIB} PRIVATE SD_HIDREAM_I1_EXPERIMENTAL)
++endif()
++
+ if(SD_SYCL)
+     message("-- Use SYCL as backend stable-diffusion")
+     set(GGML_SYCL ON)
+diff --git a/src/auto_encoder_kl.hpp b/src/auto_encoder_kl.hpp
+index 489f8fd..a3faea5 100644
+--- a/src/auto_encoder_kl.hpp
++++ b/src/auto_encoder_kl.hpp
+@@ -680,7 +680,15 @@ struct AutoEncoderKL : public VAE {
+         } else if (sd_version_is_sd3(version)) {
+             scale_factor = 1.5305f;
+             shift_factor = 0.0609f;
+-        } else if (sd_version_is_flux(version) || sd_version_is_z_image(version)) {
++        } else if (sd_version_is_flux(version) || sd_version_is_z_image(version)
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++                   // HiDream-I1 uses the Flux 16-ch VAE → same latent
++                   // normalization (0.3611/0.1159). Without this it fell to
++                   // the default scale=1/shift=0 and the diffusion ran in the
++                   // wrong latent space → VAE decode produced pure noise.
++                   || version == VERSION_HIDREAM_I1
++#endif
++        ) {
+             scale_factor = 0.3611f;
+             shift_factor = 0.1159f;
+         } else if (sd_version_uses_flux2_vae(version)) {
+diff --git a/src/diffusion_model.hpp b/src/diffusion_model.hpp
+index 9e4e444..f7f31dc 100644
+--- a/src/diffusion_model.hpp
++++ b/src/diffusion_model.hpp
+@@ -5,6 +5,9 @@
+ #include "anima.hpp"
+ #include "ernie_image.hpp"
+ #include "flux.hpp"
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++#include "hidream_i1.hpp"
++#endif
+ #include "hidream_o1.hpp"
+ #include "ltxv.hpp"
+ #include "mmdit.hpp"
+@@ -42,6 +45,11 @@ struct DiffusionParams {
+     float frame_rate                                                   = 24.f;
+     const sd::Tensor<float>* video_positions                           = nullptr;
+     const std::vector<int>* skip_layers                                = nullptr;
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++    // HiDream-I1: Llama-3.1 all-hidden-states stream (conditioner's
++    // extra_c_crossattns[0]); context=T5, y=pooled as usual.
++    const sd::Tensor<float>* hidream_llama                             = nullptr;
++#endif
+ };
+ 
+ template <typename T>
+@@ -565,6 +573,51 @@ struct HiDreamO1Model : public DiffusionModel {
+     }
+ };
+ 
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++struct HiDreamI1Model : public DiffusionModel {
++    std::string prefix;
++    HiDreamI1::HiDreamI1Runner hidream_i1;
++
++    HiDreamI1Model(ggml_backend_t backend,
++                   ggml_backend_t params_backend,
++                   const String2TensorStorage& tensor_storage_map = {},
++                   const std::string& prefix                      = "model.diffusion_model")
++        : prefix(prefix), hidream_i1(backend, params_backend, tensor_storage_map, prefix) {}
++
++    std::string get_desc() override { return hidream_i1.get_desc(); }
++    void alloc_params_buffer() override { hidream_i1.alloc_params_buffer(); }
++    void free_params_buffer() override { hidream_i1.free_params_buffer(); }
++    void free_compute_buffer() override { hidream_i1.free_compute_buffer(); }
++    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
++        hidream_i1.get_param_tensors(tensors, prefix);
++    }
++    size_t get_params_buffer_size() override { return hidream_i1.get_params_buffer_size(); }
++    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
++        hidream_i1.set_weight_adapter(adapter);
++    }
++    int64_t get_adm_in_channels() override { return 0; }
++    void set_flash_attention_enabled(bool enabled) { hidream_i1.set_flash_attention_enabled(enabled); }
++    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
++        hidream_i1.set_max_graph_vram_bytes(max_vram_bytes);
++    }
++    void set_circular_axes(bool circular_x, bool circular_y) override {
++        hidream_i1.set_circular_axes(circular_x, circular_y);
++    }
++
++    sd::Tensor<float> compute(int n_threads,
++                              const DiffusionParams& diffusion_params) override {
++        GGML_ASSERT(diffusion_params.x != nullptr);
++        GGML_ASSERT(diffusion_params.timesteps != nullptr);
++        return hidream_i1.compute(n_threads,
++                                  *diffusion_params.x,
++                                  *diffusion_params.timesteps,
++                                  tensor_or_empty(diffusion_params.context),       // T5
++                                  tensor_or_empty(diffusion_params.hidream_llama),  // Llama-3.1
++                                  tensor_or_empty(diffusion_params.y));            // pooled CLIP
++    }
++};
++#endif  // SD_HIDREAM_I1_EXPERIMENTAL
++
+ struct ZImageModel : public DiffusionModel {
+     std::string prefix;
+     ZImage::ZImageRunner z_image;
+diff --git a/src/llm.hpp b/src/llm.hpp
+index ab673b2..ce80574 100644
+--- a/src/llm.hpp
++++ b/src/llm.hpp
+@@ -36,6 +36,7 @@ namespace LLM {
+         MISTRAL_SMALL_3_2,
+         MINISTRAL_3_3B,
+         GEMMA3_12B,
++        LLAMA3,
+         ARCH_COUNT,
+     };
+ 
+@@ -46,6 +47,7 @@ namespace LLM {
+         "mistral_small3.2",
+         "ministral3.3b",
+         "gemma3_12b",
++        "llama3",
+     };
+ 
+     enum class MLPActivation {
+@@ -625,8 +627,9 @@ namespace LLM {
+         ggml_tensor* forward(GGMLRunnerContext* ctx,
+                              ggml_tensor* x,
+                              ggml_tensor* input_pos,
+-                             ggml_tensor* attention_mask = nullptr,
+-                             int rope_index              = 0) {
++                             ggml_tensor* attention_mask    = nullptr,
++                             int rope_index                 = 0,
++                             ggml_tensor* rope_freq_factors = nullptr) {
+             // x: [N, n_token, hidden_size]
+             int64_t n_token = x->ne[1];
+             int64_t N       = x->ne[2];
+@@ -660,6 +663,21 @@ namespace LLM {
+             } else if (arch == LLMArch::QWEN3) {
+                 q = ggml_rope_ext(ctx->ggml_ctx, q, input_pos, nullptr, 128, GGML_ROPE_TYPE_NEOX, 40960, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
+                 k = ggml_rope_ext(ctx->ggml_ctx, k, input_pos, nullptr, 128, GGML_ROPE_TYPE_NEOX, 40960, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
++            } else if (arch == LLMArch::LLAMA3) {
++                // Llama-3.1-8B text encoder (HiDream-I1 text_encoder_4).
++                // NEOX RoPE, head_dim=128, rope_theta=500000.
++                // Llama-3.1 applies the "llama3" piecewise inv-freq rescaling
++                // (factor=8, low_freq_factor=1, high_freq_factor=4,
++                // original_max_position_embeddings=8192). ggml_rope_ext has no
++                // scalar form of that law, so the per-pair divisors are
++                // precomputed in LLMRunner::build_graph (matching transformers'
++                // _compute_llama3_parameters) and plumbed in here as the
++                // freq_factors tensor. ggml divides theta by freq_factors[k],
++                // so freq_factors[k] = inv_freq[k] / inv_freq_llama[k] exactly
++                // reproduces the HF rescaling (Task #10, evidence-localized
++                // residual cause of the HiDream-I1 pure-noise bug).
++                q = ggml_rope_ext(ctx->ggml_ctx, q, input_pos, rope_freq_factors, head_dim, GGML_ROPE_TYPE_NEOX, 131072, 500000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
++                k = ggml_rope_ext(ctx->ggml_ctx, k, input_pos, rope_freq_factors, head_dim, GGML_ROPE_TYPE_NEOX, 131072, 500000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
+             } else if (arch == LLMArch::GEMMA3_12B) {
+                 float rope_theta = (rope_index == 1 ? 10000.0f : 1000000.0f);
+                 float rope_scale = (rope_index == 1 ? 1.f : 8.f);
+@@ -748,7 +766,8 @@ namespace LLM {
+                              ggml_tensor* x,
+                              ggml_tensor* input_pos,
+                              ggml_tensor* attention_mask         = nullptr,
+-                             ggml_tensor* sliding_attention_mask = nullptr) {
++                             ggml_tensor* sliding_attention_mask = nullptr,
++                             ggml_tensor* rope_freq_factors      = nullptr) {
+             // x: [N, n_token, hidden_size]
+             auto self_attn                                  = std::dynamic_pointer_cast<Attention>(blocks["self_attn"]);
+             auto mlp                                        = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
+@@ -771,7 +790,7 @@ namespace LLM {
+ 
+             auto residual = x;
+             x             = input_layernorm->forward(ctx, x);
+-            x             = self_attn->forward(ctx, x, input_pos, block_attention_mask, rope_index);
++            x             = self_attn->forward(ctx, x, input_pos, block_attention_mask, rope_index, rope_freq_factors);
+             if (post_attention_norm != nullptr) {
+                 x = post_attention_norm->forward(ctx, x);
+             }
+@@ -817,7 +836,8 @@ namespace LLM {
+                                     ggml_tensor* attention_mask,
+                                     std::set<int> out_layers,
+                                     ggml_tensor* sliding_attention_mask = nullptr,
+-                                    bool return_all_hidden_states       = false) {
++                                    bool return_all_hidden_states       = false,
++                                    ggml_tensor* rope_freq_factors      = nullptr) {
+             auto norm = std::dynamic_pointer_cast<LLMRMSNorm>(blocks["norm"]);
+             std::vector<ggml_tensor*> intermediate_outputs;
+ 
+@@ -832,7 +852,7 @@ namespace LLM {
+             for (int i = 0; i < num_layers; i++) {
+                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["layers." + std::to_string(i)]);
+ 
+-                x = block->forward(ctx, x, input_pos, attention_mask, sliding_attention_mask);
++                x = block->forward(ctx, x, input_pos, attention_mask, sliding_attention_mask, rope_freq_factors);
+                 if (return_all_hidden_states || out_layers.size() > 1) {
+                     x = ggml_cont(ctx->ggml_ctx, x);
+                 }
+@@ -875,7 +895,8 @@ namespace LLM {
+                              ggml_tensor* sliding_attention_mask,
+                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
+                              std::set<int> out_layers,
+-                             bool return_all_hidden_states = false) {
++                             bool return_all_hidden_states  = false,
++                             ggml_tensor* rope_freq_factors = nullptr) {
+             // input_ids: [N, n_token]
+             // return: [N, n_token, hidden_size]
+             auto x = embed(ctx, input_ids);
+@@ -886,7 +907,8 @@ namespace LLM {
+                                   attention_mask,
+                                   std::move(out_layers),
+                                   sliding_attention_mask,
+-                                  return_all_hidden_states);
++                                  return_all_hidden_states,
++                                  rope_freq_factors);
+         }
+     };
+ 
+@@ -911,7 +933,8 @@ namespace LLM {
+                              ggml_tensor* sliding_attention_mask,
+                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
+                              std::set<int> out_layers,
+-                             bool return_all_hidden_states = false) {
++                             bool return_all_hidden_states  = false,
++                             ggml_tensor* rope_freq_factors = nullptr) {
+             // input_ids: [N, n_token]
+             auto model = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
+ 
+@@ -922,7 +945,8 @@ namespace LLM {
+                                     sliding_attention_mask,
+                                     image_embeds,
+                                     out_layers,
+-                                    return_all_hidden_states);
++                                    return_all_hidden_states,
++                                    rope_freq_factors);
+             return x;
+         }
+ 
+@@ -949,6 +973,7 @@ namespace LLM {
+         LLM model;
+ 
+         std::vector<int> input_pos_vec;
++        std::vector<float> rope_freq_factors_vec;
+         std::vector<float> attention_mask_vec;
+         std::vector<float> sliding_attention_mask_vec;
+         std::vector<float> window_mask_vec;
+@@ -1202,6 +1227,18 @@ namespace LLM {
+                 params.rope_thetas             = {1000000.f, 10000.f};
+                 params.rope_scales             = {8.f, 1.f};
+                 params.sliding_attention       = {1024, 1024, 1024, 1024, 1024, 0};
++            } else if (arch == LLMArch::LLAMA3) {
++                // Llama-3.1-8B (HiDream-I1 text_encoder_4). hidden_size,
++                // vocab_size, intermediate_size and num_layers are
++                // auto-detected from the tensor map by the loop below.
++                params.head_dim                = 128;
++                params.num_heads               = 32;
++                params.num_kv_heads            = 8;
++                params.qkv_bias                = false;
++                params.qk_norm                 = false;
++                params.rms_norm_eps            = 1e-5f;
++                params.max_position_embeddings = 131072;
++                params.mlp_activation          = MLPActivation::SILU;
+             }
+             bool have_vision_weight = false;
+             bool llama_cpp_style    = false;
+@@ -1274,7 +1311,8 @@ namespace LLM {
+                              ggml_tensor* sliding_attention_mask,
+                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
+                              std::set<int> out_layers,
+-                             bool return_all_hidden_states = false) {
++                             bool return_all_hidden_states  = false,
++                             ggml_tensor* rope_freq_factors = nullptr) {
+             auto hidden_states = model.forward(ctx,
+                                                input_ids,
+                                                input_pos,
+@@ -1282,7 +1320,8 @@ namespace LLM {
+                                                sliding_attention_mask,
+                                                image_embeds,
+                                                out_layers,
+-                                               return_all_hidden_states);  // [N, n_token, hidden_size]
++                                               return_all_hidden_states,
++                                               rope_freq_factors);  // [N, n_token, hidden_size]
+             return hidden_states;
+         }
+ 
+@@ -1315,7 +1354,8 @@ namespace LLM {
+             if (params.arch == LLMArch::MISTRAL_SMALL_3_2 ||
+                 params.arch == LLMArch::MINISTRAL_3_3B ||
+                 params.arch == LLMArch::QWEN3 ||
+-                params.arch == LLMArch::GEMMA3_12B) {
++                params.arch == LLMArch::GEMMA3_12B ||
++                params.arch == LLMArch::LLAMA3) {
+                 input_pos_vec.resize(n_tokens);
+                 for (int i = 0; i < n_tokens; ++i) {
+                     input_pos_vec[i] = i;
+@@ -1335,6 +1375,44 @@ namespace LLM {
+                                                 input_pos_vec.size());
+             set_backend_tensor_data(input_pos, input_pos_vec.data());
+ 
++            // Llama-3.1 "llama3" RoPE rescaling (HiDream-I1 text_encoder_4).
++            // Precompute the per-pair freq_factors exactly as transformers'
++            // _compute_llama3_parameters does, then feed it to ggml_rope_ext
++            // (which divides theta by freq_factors[k]): freq_factors[k] =
++            // inv_freq[k] / inv_freq_llama[k]. Constants are the published
++            // Llama-3.1 rope_scaling (factor=8, low_freq_factor=1,
++            // high_freq_factor=4, original_max_position_embeddings=8192) and
++            // rope_theta=500000 — verified against the HF config, not guessed.
++            ggml_tensor* rope_freq_factors = nullptr;
++            if (params.arch == LLMArch::LLAMA3) {
++                const int64_t half      = params.head_dim / 2;
++                const double base       = 500000.0;
++                const double factor     = 8.0;
++                const double low_ff     = 1.0;
++                const double high_ff    = 4.0;
++                const double old_ctx    = 8192.0;
++                const double low_wavel  = old_ctx / low_ff;   // 8192
++                const double high_wavel = old_ctx / high_ff;  // 2048
++                const double two_pi     = 2.0 * 3.14159265358979323846;
++                rope_freq_factors_vec.resize(half);
++                for (int64_t k = 0; k < half; k++) {
++                    double inv_freq = std::pow(base, -(2.0 * (double)k) / (double)params.head_dim);
++                    double wavelen  = two_pi / inv_freq;
++                    double inv_freq_llama;
++                    if (wavelen > low_wavel) {
++                        inv_freq_llama = inv_freq / factor;
++                    } else if (wavelen < high_wavel) {
++                        inv_freq_llama = inv_freq;
++                    } else {
++                        double smooth  = (old_ctx / wavelen - low_ff) / (high_ff - low_ff);
++                        inv_freq_llama = (1.0 - smooth) * (inv_freq / factor) + smooth * inv_freq;
++                    }
++                    rope_freq_factors_vec[k] = (float)(inv_freq / inv_freq_llama);
++                }
++                rope_freq_factors = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, half);
++                set_backend_tensor_data(rope_freq_factors, rope_freq_factors_vec.data());
++            }
++
+             ggml_tensor* attention_mask         = nullptr;
+             ggml_tensor* sliding_attention_mask = nullptr;
+             if (!attention_mask_tensor.empty()) {
+@@ -1383,7 +1461,8 @@ namespace LLM {
+                                                  sliding_attention_mask,
+                                                  image_embeds,
+                                                  out_layers,
+-                                                 return_all_hidden_states);
++                                                 return_all_hidden_states,
++                                                 rope_freq_factors);
+ 
+             ggml_build_forward_expand(gf, hidden_states);
+ 
+diff --git a/src/model.cpp b/src/model.cpp
+index 9929605..2b71640 100644
+--- a/src/model.cpp
++++ b/src/model.cpp
+@@ -441,6 +441,15 @@ SDVersion ModelLoader::get_sd_version() {
+             tensor_storage_map.find("model.language_model.layers.0.self_attn.q_proj.weight") != tensor_storage_map.end()) {
+             return VERSION_HIDREAM_O1;
+         }
++        // Original HiDream-I1 (17B sparse-MoE MMDiT). Distinct from HiDream-O1
++        // (Qwen3-VL LLM backbone): I1 has the dual-stream MoE signature and is
++        // diffusion-only — the 4 text encoders + Flux VAE are supplied
++        // separately, so do NOT require a bundled language_model here.
++        // Detection is prefix-agnostic (substring) because this loads via
++        // --diffusion-model (names get a "model.diffusion_model." prefix).
++        if (tensor_storage.name.find("double_stream_blocks.0.block.ff_i.experts.0.w1.weight") != std::string::npos) {
++            return VERSION_HIDREAM_I1;
++        }
+         if (tensor_storage.name.find("model.diffusion_model.transformer_blocks.0.img_mod.1.weight") != std::string::npos) {
+             return VERSION_QWEN_IMAGE;
+         }
+diff --git a/src/model.h b/src/model.h
+index c0a8d81..8c306b4 100644
+--- a/src/model.h
++++ b/src/model.h
+@@ -44,6 +44,7 @@ enum SDVersion {
+     VERSION_FLUX2_KLEIN,
+     VERSION_LTXAV,
+     VERSION_HIDREAM_O1,
++    VERSION_HIDREAM_I1,
+     VERSION_Z_IMAGE,
+     VERSION_OVIS_IMAGE,
+     VERSION_ERNIE_IMAGE,
+@@ -174,6 +175,9 @@ static inline bool sd_version_is_dit(SDVersion version) {
+         sd_version_is_wan(version) ||
+         sd_version_is_qwen_image(version) ||
+         version == VERSION_HIDREAM_O1 ||
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++        version == VERSION_HIDREAM_I1 ||
++#endif
+         sd_version_is_anima(version) ||
+         sd_version_is_z_image(version) ||
+         sd_version_is_ernie_image(version)) {
+diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
+index bb04efb..aed3e2b 100644
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -58,6 +58,7 @@ const char* model_version_to_str[] = {
+     "Flux.2 klein",
+     "LTXAV",
+     "HiDream O1",
++    "HiDream I1",
+     "Z-Image",
+     "Ovis Image",
+     "Ernie Image",
+@@ -600,6 +601,30 @@ public:
+                                                                    params_backend_for(SDBackendModule::DIFFUSION),
+                                                                    tensor_storage_map,
+                                                                    "model");
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++            } else if (version == VERSION_HIDREAM_I1) {
++                auto hidream_i1_cond = std::make_shared<HiDreamI1::HiDreamI1Conditioner>(backend_for(SDBackendModule::TE),
++                                                                                        params_backend_for(SDBackendModule::TE),
++                                                                                        tensor_storage_map);
++                // Phase B (Task #8): the real-pipeline ctor only receives
++                // tensor_storage_map, so without this the Llama branch falls
++                // back to LLMEmbedder's Qwen2 tokenizer (vocab 151936) and
++                // get_rows OOB-crashes on Llama-3.1's 128256 embed_tokens
++                // (the pure-noise root cause). sd_ctx_params->llm_path (the
++                // --llm GGUF, already loaded at L305-307) is in scope here,
++                // so build the reference-faithful Llama-3.1 BPE straight from
++                // it — the exact fix the Step-5 conditioner-isolation harness
++                // proved out (no crash; structured embeddings).
++                if (strlen(SAFE_STR(sd_ctx_params->llm_path)) > 0) {
++                    hidream_i1_cond->llama3_tok =
++                        std::make_shared<HiDreamI1::Llama3Tokenizer>(sd_ctx_params->llm_path);
++                }
++                cond_stage_model = hidream_i1_cond;
++                diffusion_model  = std::make_shared<HiDreamI1Model>(backend_for(SDBackendModule::DIFFUSION),
++                                                                    params_backend_for(SDBackendModule::DIFFUSION),
++                                                                    tensor_storage_map,
++                                                                    "model.diffusion_model");
++#endif
+             } else if (sd_version_is_anima(version)) {
+                 cond_stage_model = std::make_shared<AnimaConditioner>(backend_for(SDBackendModule::TE),
+                                                                       params_backend_for(SDBackendModule::TE),
+@@ -1095,6 +1120,11 @@ public:
+                     } else {
+                         default_flow_shift = 3.f;
+                     }
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++                } else if (version == VERSION_HIDREAM_I1) {
++                    pred_type          = FLUX_FLOW_PRED;
++                    default_flow_shift = 3.0f;  // FIDELITY TODO (README step 5): confirm vs reference
++#endif
+                 } else if (sd_version_is_flux(version)) {
+                     pred_type = FLUX_FLOW_PRED;
+ 
+@@ -1971,6 +2001,9 @@ public:
+                 diffusion_params.context      = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                 diffusion_params.c_concat     = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
+                 diffusion_params.y            = condition.c_vector.empty() ? nullptr : &condition.c_vector;
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++                diffusion_params.hidream_llama = condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0];
++#endif
+                 diffusion_params.t5_ids       = condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids;
+                 diffusion_params.t5_weights   = condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights;
+                 diffusion_params.input_ids    = condition.c_input_ids.empty() ? nullptr : &condition.c_input_ids;
+@@ -2759,6 +2792,61 @@ static bool sd_version_supports_image_generation(SDVersion version) {
+ }
+ 
+ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
++#ifdef SD_HIDREAM_I1_EXPERIMENTAL
++    // Step-5 numerical-validation hook (dev only; no effect unless the env var
++    // is set, so this is byte-identical to vanilla AND to a normal
++    // experimental run). HIDREAM_I1_VAL="<diffusion_gguf>;<io_dir>;<stage>"
++    // with stage in {x_emb,dbl0,sgl31,final} (empty/omitted = full image):
++    // runs HiDreamI1Runner::load_from_file_and_test on the fixed inputs
++    // tools/hidream_i1_ref.py wrote into <io_dir>, dumps sdcpp_<stage>.bin,
++    // and exits — so validation needs no hand-edited driver, just:
++    //   HIDREAM_I1_VAL="m.gguf;./val;dbl0" sd-cli   (any args; it exits first)
++    if (const char* hv = getenv("HIDREAM_I1_VAL")) {
++        std::string spec(hv);
++        auto cut = [&](char d) {
++            size_t p = spec.find(d);
++            std::string h = spec.substr(0, p);
++            spec = (p == std::string::npos) ? std::string() : spec.substr(p + 1);
++            return h;
++        };
++        std::string gguf = cut(';');
++        std::string io   = cut(';');
++        std::string stg  = cut(';');
++        if (gguf.empty() || io.empty()) {
++            LOG_ERROR("HIDREAM_I1_VAL must be \"<diffusion_gguf>;<io_dir>[;<stage>]\"");
++        } else {
++            HiDreamI1::HiDreamI1Runner::load_from_file_and_test(gguf, io, stg);
++        }
++        exit(0);
++    }
++    // Step-5 conditioner-isolation hook (dev only; inert unless set). Runs
++    // sd.cpp's OWN HiDreamI1Conditioner on the fixed reference prompt and
++    // dumps sdcpp_{t5,llama,pooled}.bin for hidream_i1_cmp.py to diff against
++    // the authoritative diffusers val/{t5,llama,pooled}.bin — pinpoints which
++    // encoder is the residual pure-noise bug (transformer already cleared):
++    //   HIDREAM_I1_COND="<clip_l>;<clip_g>;<t5>;<llm>;<io_dir>;<prompt>" sd-cli
++    if (const char* hc = getenv("HIDREAM_I1_COND")) {
++        std::string spec(hc);
++        auto cut = [&](char d) {
++            size_t p      = spec.find(d);
++            std::string h = spec.substr(0, p);
++            spec          = (p == std::string::npos) ? std::string() : spec.substr(p + 1);
++            return h;
++        };
++        std::string cl = cut(';');
++        std::string cg = cut(';');
++        std::string t5 = cut(';');
++        std::string lm = cut(';');
++        std::string io = cut(';');
++        std::string pr = spec;  // remainder = prompt (may contain ';')
++        if (io.empty() || pr.empty()) {
++            LOG_ERROR("HIDREAM_I1_COND must be \"<clip_l>;<clip_g>;<t5>;<llm>;<io_dir>;<prompt>\"");
++        } else {
++            HiDreamI1::HiDreamI1Conditioner::dump_conditioner_and_test(cl, cg, t5, lm, io, pr);
++        }
++        exit(0);
++    }
++#endif
+     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+     if (sd_ctx == nullptr) {
+         return nullptr;

@@ -5,17 +5,24 @@
 # and toggles SdCuda / SdVulkan / SdHipblas accordingly. Override by editing
 # build\config-build.psd1 before running this script.
 
-. "$PSScriptRoot\common.ps1"  # loads $cfg, adds ROCm to PATH
+. "$PSScriptRoot\common.ps1"            # loads $cfg, adds ROCm to PATH
+. "$PSScriptRoot\sdcpp-patches\patch-lib.ps1"  # Reset-SdCppClone / Invoke-SdCppPatches
 Enable-VsDevShell
 
+$patchRoot = Join-Path $PSScriptRoot 'sdcpp-patches'
+
 # Clone stable-diffusion.cpp if missing, otherwise pull latest (recursive so
-# the ggml submodule stays in sync).
+# the ggml submodule stays in sync). sdcpp-patches\ layers local source/wiring
+# changes (e.g. HiDream-I1) on top: Reset-SdCppClone strips them BEFORE the
+# pull so `--ff-only` always sees a clean tree, Invoke-SdCppPatches re-applies
+# them AFTER the sync so every build is reproducible from the patch folder.
 if (-not (Test-Path "$($cfg.StableDiffusionCppDir)\CMakeLists.txt")) {
     Write-Host "stable-diffusion.cpp not found at $($cfg.StableDiffusionCppDir), cloning..." -ForegroundColor Yellow
     git clone --recursive https://github.com/leejet/stable-diffusion.cpp $cfg.StableDiffusionCppDir
     if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
 } else {
     Write-Host "Pulling latest stable-diffusion.cpp..." -ForegroundColor Cyan
+    Reset-SdCppClone -CloneDir $cfg.StableDiffusionCppDir -PatchRoot $patchRoot
     git -C $cfg.StableDiffusionCppDir pull --ff-only
     if ($LASTEXITCODE -ne 0) { throw "git pull failed" }
     if (Test-Path "$($cfg.StableDiffusionCppDir)\.gitmodules") {
@@ -23,6 +30,9 @@ if (-not (Test-Path "$($cfg.StableDiffusionCppDir)\CMakeLists.txt")) {
         if ($LASTEXITCODE -ne 0) { throw "git submodule update failed" }
     }
 }
+
+Write-Host "Applying sdcpp-patches..." -ForegroundColor Cyan
+Invoke-SdCppPatches -CloneDir $cfg.StableDiffusionCppDir -PatchRoot $patchRoot
 
 $buildDir = Join-Path $PSScriptRoot "build\cmake-build"
 New-Item -ItemType Directory -Path $buildDir -Force | Out-Null

@@ -21,6 +21,11 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# patch-lib defines functions only (no $cfg dependency) so it is safe to
+# dot-source here, before 01-configure.ps1 has ever run.
+. "$PSScriptRoot\sdcpp-patches\patch-lib.ps1"
+$patchRoot = Join-Path $PSScriptRoot 'sdcpp-patches'
+
 function Test-IsAdmin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -133,6 +138,9 @@ if ($blocks.Count -gt 0) {
 if ($cfg -and $beforeSd) {
     Write-Host ""
     Write-Host "Updating stable-diffusion.cpp..." -ForegroundColor Cyan
+    # Strip sdcpp-patches\ edits so the tree is clean for --ff-only (HEAD is
+    # not moved, so the before/after rebuild-detection below stays accurate).
+    Reset-SdCppClone -CloneDir $cfg.StableDiffusionCppDir -PatchRoot $patchRoot
     git -C $cfg.StableDiffusionCppDir pull --ff-only
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  git pull failed in $($cfg.StableDiffusionCppDir)" -ForegroundColor Yellow
@@ -141,6 +149,8 @@ if ($cfg -and $beforeSd) {
     if (Test-Path "$($cfg.StableDiffusionCppDir)\.gitmodules") {
         git -C $cfg.StableDiffusionCppDir submodule update --init --recursive | Out-Null
     }
+    # Re-apply local patches so the clone is left in its built state.
+    Invoke-SdCppPatches -CloneDir $cfg.StableDiffusionCppDir -PatchRoot $patchRoot
 }
 
 # ── Capture post-state ──────────────────────────────────────────────

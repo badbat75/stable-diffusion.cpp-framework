@@ -115,7 +115,15 @@ if ($Preset) {
     Write-Host ""
     Write-Host "Available presets:" -ForegroundColor Cyan
     for ($i = 0; $i -lt $presets.Count; $i++) {
-        $model = if ($presets[$i].Keys.ContainsKey('model')) { $presets[$i].Keys['model'] } else { '<no model>' }
+        # Show the model path regardless of whether the preset uses the
+        # all-in-one bundle ('model' -> -m) or the split form
+        # ('diffusion-model' -> --diffusion-model). Flag a genuinely missing
+        # file so '<no model>' can't be mistaken for a detection failure.
+        $model = '<no model>'
+        foreach ($k in @('model', 'diffusion-model')) {
+            if ($presets[$i].Keys.ContainsKey($k) -and $presets[$i].Keys[$k]) { $model = $presets[$i].Keys[$k]; break }
+        }
+        if ($model -ne '<no model>' -and -not (Test-Path -LiteralPath $model)) { $model = "$model  (FILE MISSING)" }
         Write-Host ("  [{0,2}] {1,-30}  {2}" -f ($i + 1), $presets[$i].Id, $model)
     }
     while (-not $active) {
