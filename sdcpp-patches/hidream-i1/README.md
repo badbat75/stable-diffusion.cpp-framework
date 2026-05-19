@@ -170,11 +170,24 @@ tensor table — see commit history / project memory.
      restored to OFF exit 0. Harness `Reset`→`Invoke` round-trips clean.
    *`wiring.patch` (6 files: + `CMakeLists.txt`, `src/diffusion_model.hpp`).*
 
-5. **Validate numerically** — *remaining; needs an external diffusers /
-   ComfyUI-GGUF reference (not available in the build env).* `wiring.patch`
-   regeneration + harness round-trip are **DONE**, and the sd.cpp-side
-   validation harness is **scaffolded** (in `src/hidream_i1.hpp`, gated, not
-   in `wiring.patch`):
+5. **Validate numerically — ✅ DONE (2026-05-18/19).** The diffusers reference
+   WAS run (HF token loaded; `tools/val/ref_{x_emb,dbl0,sgl31,final}.bin`
+   captured 2026-05-18 22:29 by `tools/hidream_i1_ref.py`) and the per-stage
+   diff performed. Result: the **transformer is numerically faithful**
+   (final-latent cos 0.99995 under `HIDREAM_I1_INJECT_COND` isolation). The
+   diff localised — and `flow_dir_check.py` confirmed — the residual
+   pure-noise bug as a flow-direction sign error (diffusers negates the
+   transformer output before FlowMatch; sd.cpp's shared `FluxFlowDenoiser`
+   used Flux's sign); **fixed** via `return out * -1.0f` in
+   `HiDreamI1Runner::compute()` (see status banner at the top). The ONLY
+   residual is a **separate, already-localised conditioner-fidelity gap**
+   (slight orange/saturation drift): three named contributors — Q8/quant
+   error, the ~0.49 |sd|/|ref| Llama-3.1 hidden-states norm ratio, and the
+   Llama-3.1 tokenizer. Non-structural, NOT a "Step-5 not done" item; closing
+   it is conditioner code work (priority list below), not a missing reference.
+   `wiring.patch` regeneration + harness round-trip are **DONE**. The
+   sd.cpp-side validation harness (kept for re-runs / regression; in
+   `src/hidream_i1.hpp`, gated, not in `wiring.patch`):
    - `HiDreamI1::dump_f32` + `compute_capture` + a `capture` tap after
      `x_embedder` / double-block 0 / single-block 31 / `final_layer` (tags
      `x_emb`/`dbl0`/`sgl31`/`final`; empty in all normal use).
