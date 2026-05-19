@@ -1159,6 +1159,35 @@ namespace HiDreamI1 {
                     toks    = std::get<0>(tw);
                 }
                 sd::Tensor<int32_t> ids({(int64_t)toks.size()}, toks);
+                // CRITICAL (measured 2026-05-19, conditioner-isolation diff):
+                // diffusers _get_llama3_prompt_embeds passes the tokenizer
+                // attention_mask into the (causal) Llama-3.1; sd.cpp's
+                // LLMRunner builds ONLY a causal mask when none is supplied
+                // (llm.hpp:1418-1432), so the ~121 right-pad positions attend
+                // to real tokens instead of being masked — ~95% of the 128
+                // stack positions then diverge from the reference (llama
+                // cos 0.39 / ‖sd‖/‖ref‖ 0.49, vs T5 0.99 which DOES get its
+                // pad mask here). Build the combined causal+padding 2-D
+                // [n,n] mask exactly as the empty-mask branch's causal fill
+                // (index [q*n + k], 0 keep / -INF mask) AND additionally mask
+                // pad KEY columns, mirroring the proven T5 path above.
+                sd::Tensor<float> llama_mask;
+                if (llama3_tok && llama3_tok->ok) {
+                    const int64_t n = (int64_t)toks.size();
+                    int64_t real_len = n;  // diffusers right-pads with PAD(=EOS)
+                    while (real_len > 0 &&
+                           toks[(size_t)real_len - 1] == llama3_tok->PAD_TOKEN_ID) {
+                        real_len--;
+                    }
+                    std::vector<float> m((size_t)(n * n));
+                    for (int64_t q = 0; q < n; q++) {
+                        for (int64_t k = 0; k < n; k++) {
+                            bool masked = (k > q) || (k >= real_len);
+                            m[(size_t)(q * n + k)] = masked ? -INFINITY : 0.f;
+                        }
+                    }
+                    llama_mask = sd::Tensor<float>({n, n}, m);
+                }
                 // return_all_hidden_states = true → LLM::forward_embeds
                 // concats all 33 hidden states along ne0 (llm.hpp:870):
                 // [embed, L0..L30, norm(L31)] × caption_in. forward()'s
@@ -1166,7 +1195,7 @@ namespace HiDreamI1 {
                 // (HF llama3[k] == stack block 1+k) BEFORE caption_proj, so
                 // the 4096-wide matmul is well-formed. (The single-final-
                 // tensor stand-in is gone — #2 is implemented.)
-                auto h = llama->model.compute(n_threads, ids, sd::Tensor<float>(),
+                auto h = llama->model.compute(n_threads, ids, llama_mask,
                                               {}, std::set<int>(), true);
                 result.extra_c_crossattns.push_back(std::move(h));
             }
