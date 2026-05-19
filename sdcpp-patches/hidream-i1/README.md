@@ -124,8 +124,13 @@ tensor table — see commit history / project memory.
    through `Attention`. HiDream pads the Llama branch to 128 tokens (<< 8192)
    so unscaled rope is close but not bit-exact.
 
-2. **`src/hidream_i1.hpp` — the model + conditioner. ✅ DONE
-   (compile-verified; numerics pending step 5).** Header-only NEW file,
+2. **`src/hidream_i1.hpp` — the model + conditioner. ✅ DONE &
+   NUMERICALLY VALIDATED.** (Status: the Step-5 "numerics pending" /
+   `FIDELITY TODO` framing below is historical — see the banner at the top:
+   the FluxFlow output-sign, Llama-3.1 tokenization, and CLIP-L
+   `text_projection`/248-pos pooled root causes have all been found, fixed
+   and measured; only the minor Llama pad-position ~2.9× item remains.)
+   Header-only NEW file,
    copied into the clone by the harness (no CMake change, like
    `hidream_o1.hpp`); reuses `Flux::{RMSNorm,LastLayer,modulate,
    ModulationOut}` since the shapes are identical. Contains:
