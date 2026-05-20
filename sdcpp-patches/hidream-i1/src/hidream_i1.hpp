@@ -25,19 +25,32 @@
 //      (i-16), 48 -> T5), plus a pooled CLIP-L+CLIP-G vector through
 //      `p_embedder` added into the timestep modulation vector.
 //
-// FIDELITY TODOs (tracked in sdcpp-patches/hidream-i1/README.md step 5 — these
-// need a diffusers/ComfyUI reference run to pin down and are intentionally NOT
-// guessed silently, mirroring the llama3-RoPE gap handled the same way in
-// Step 1):
-//   * MoE routing: this computes all 4 experts and weights them by the full
-//     router softmax (+shared). The reference keeps only the top-2 and
-//     renormalises their weights to sum to 1. Bounded, isolated correctness
-//     item — flip MOE_TOP2_RENORM on once validated.
-//   * Per-block Llama layer selection (`config.llama_layers`) and the exact
-//     T5/Llama concat order feeding each block's text stream.
-//   * Joint RoPE position scheme over the [img;txt] sequence (EmbedND
-//     theta=10000, axes=(32,32)); image tokens use the 2D grid, text token
-//     positions follow Flux's running-index convention here.
+// FIDELITY STATUS (the items below were "TODO pending a diffusers reference"
+// in the original plan; the reference WAS run 2026-05-18/19 and the per-stage
+// numeric diff performed — see README step 5 + project memory
+// `hidream-i1-architecture` / `hidream-i1-noise-rootcause`. All RESOLVED;
+// recorded here so the constants stay auditable, not as open work):
+//   * MoE routing — RESOLVED. Implemented as the authoritative diffusers
+//     `MoEGate`: softmax(4) → top-2 → weights used AS-IS (norm_topk_prob =
+//     False, verified from source — there is NO renorm; the earlier "renorm
+//     to sum 1" plan and the MOE_TOP2_RENORM flag were both wrong and removed).
+//     Now the unconditional default (MoEFeedForward::forward).
+//   * Per-block Llama layer selection — RESOLVED. `config.llama_layers` =
+//     [0..31, 31×16] is implemented (HiDreamI1::forward: `caption_proj(LL[i])`
+//     over the 49 projections + the running [T5proj;L31proj] text stream
+//     carried through the 16 double blocks then fused into the single blocks),
+//     verbatim from `transformer_hidream_image.py`.
+//   * Joint RoPE — RESOLVED. EmbedND theta=10000, axes_dims_rope = {64,32,32}
+//     (official HiDream-I1-Full config; Σ=128=head_dim — the old (32,32) note
+//     was wrong), image-first [img;txt] pe reorder; gen_flux_pe path.
+//   * Llama-3.1 "llama3" RoPE freq rescaling — RESOLVED in wiring.patch
+//     (llm.hpp): precomputed freq_factors (factor 8 / low 1 / high 4 /
+//     orig 8192, theta 500000) per the HF Llama-3.1 config.
+// The pure-noise bug was root-caused (FluxFlow output-sign: `return out *
+// -1.0f` here) and the pure-white bug fixed at source (F16-overflow →
+// kv_scale=1/128 in JointAttention). Only residual MEASURED item, minor and
+// sub-catastrophic, NOT a wrong constant: the Llama pad-position hidden states
+// run ~2.9× (project memory `hidream-i1-llama-encoder-bug-measured`).
 //
 // See sdcpp-patches\hidream-i1\README.md for the implementation plan and the
 // project memory `hidream-i1-architecture.md` for the exact GGUF tensor table.
@@ -1056,11 +1069,14 @@ namespace HiDreamI1 {
 
         SDCondition get_learned_condition(int n_threads,
                                           const ConditionerParams& cp) override {
-            // FIDELITY TODO (README step 5): token padding length, the exact
-            // Llama chat template, and which Llama hidden states the
-            // transformer's caption_projection consumes are pinned by the
-            // reference. This wires the encoders structurally; numbers need a
-            // reference run.
+            // FIDELITY: RESOLVED via the 2026-05-18/19 reference run. Token
+            // padding lengths (CLIP-L = checkpoint n_token / 248, CLIP-G 77,
+            // T5 128, Llama 128), the Llama-3.1 tokenizer + chat template
+            // (llama3_tokenizer.hpp; add_bos_token=false, PAD=BOS), and which
+            // Llama hidden states caption_projection consumes (llama_layers =
+            // [0..31, 31×16]) are all pinned to the reference. Only residual
+            // measured item: Llama pad-position hidden states ~2.9× (memory
+            // `hidream-i1-llama-encoder-bug-measured`) — minor, not structural.
             SDCondition result;
             // Task #11 — ref-driven full-sampler isolation (dev only; inert
             // unless the env var is set, so byte-identical to a normal run).

@@ -3,7 +3,8 @@
 #
 # Each subfolder of sdcpp-patches\ is one patch set:
 #   <name>\src\*           - NEW header-only sources, COPIED into <clone>\src\
-#   <name>\wiring.patch    - unified diff against tracked upstream files
+#   <name>\wiring.patch    - unified diff against tracked upstream files (root)
+#   <name>\ggml.patch      - unified diff against files INSIDE the ggml submodule
 #   <name>\base-commit.txt - upstream SHA the patch was generated against
 #   <name>\README.md       - what it is + how to regenerate the patch
 #
@@ -14,6 +15,14 @@
 # patches are re-applied fresh on every build. This file defines functions
 # only (no $cfg dependency) so 00-install-prerequisites.ps1 — which must run
 # on a bare machine before 01-configure.ps1 — can dot-source it safely.
+#
+# Submodule patches: ggml.patch is applied with `git -C <clone>/ggml apply`,
+# and Reset-SdCppClone resets the ggml submodule alongside the parent so a
+# subsequent submodule sync sees a clean tree. Each ggml.patch supports
+# "already applied upstream" detection — if `git apply --reverse --check`
+# succeeds, the patch is treated as merged-in and silently skipped, which is
+# what lets a stale ggml-targeted patch survive the day sd.cpp bumps its ggml
+# gitlink past the upstream fix.
 
 function Get-SdCppPatchSets {
     param([Parameter(Mandatory)][string]$PatchRoot)
@@ -24,15 +33,21 @@ function Get-SdCppPatchSets {
 
 function Reset-SdCppClone {
     # Revert every patch-set modification so `git pull --ff-only` sees a clean
-    # tree. Tracked-file edits are undone with `reset --hard HEAD` (HEAD does
-    # NOT move, so the rebuild-detection report stays accurate); the untracked
-    # headers we copied in are deleted by name. Submodules are never touched.
+    # tree. Tracked-file edits in the parent are undone with `reset --hard
+    # HEAD` (HEAD does NOT move, so the rebuild-detection report stays
+    # accurate); the untracked headers we copied in are deleted by name. The
+    # ggml submodule is also reset (`git -C ggml reset --hard HEAD`) so the
+    # next `git submodule update --init --recursive` doesn't trip over a dirty
+    # tree from a previous run's ggml.patch.
     param(
         [Parameter(Mandatory)][string]$CloneDir,
         [Parameter(Mandatory)][string]$PatchRoot
     )
     if (-not (Test-Path "$CloneDir\.git")) { return }
     git -C $CloneDir reset --hard HEAD --quiet
+    if (Test-Path "$CloneDir\ggml\.git") {
+        git -C "$CloneDir\ggml" reset --hard HEAD --quiet
+    }
     foreach ($set in Get-SdCppPatchSets $PatchRoot) {
         $srcDir = Join-Path $set.FullName 'src'
         if (-not (Test-Path $srcDir)) { continue }
@@ -44,9 +59,10 @@ function Reset-SdCppClone {
 }
 
 function Test-PatchHasDiff {
-    # A wiring.patch with no `diff --git` / `--- ` lines (e.g. comment-only
-    # placeholder) is treated as "no tracked-file changes yet" and skipped,
-    # so the harness builds vanilla upstream until a real patch lands.
+    # A wiring.patch / ggml.patch with no `diff --git` / `--- ` lines (e.g.
+    # comment-only placeholder) is treated as "no tracked-file changes yet"
+    # and skipped, so the harness builds vanilla upstream until a real patch
+    # lands.
     param([string]$PatchFile)
     if (-not (Test-Path $PatchFile)) { return $false }
     foreach ($line in Get-Content -Path $PatchFile) {
@@ -55,10 +71,45 @@ function Test-PatchHasDiff {
     return $false
 }
 
+function Invoke-PatchInRepo {
+    # Apply $PatchFile inside $RepoDir using `git -C $RepoDir apply`. If the
+    # forward apply fails, try `apply --reverse --check`: a clean reverse
+    # means the patch's effect is already present in the tree (upstream
+    # merged the same fix, or a prior partial run left it applied) — in
+    # which case we log "already applied" and return without throwing. Any
+    # other failure surfaces as a hard error with a regenerate hint.
+    param(
+        [Parameter(Mandatory)][string]$RepoDir,
+        [Parameter(Mandatory)][string]$PatchFile,
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$PatchSetName
+    )
+    git -C $RepoDir apply --check --whitespace=nowarn $PatchFile 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  [patch:$PatchSetName] applying $Label" -ForegroundColor Cyan
+        git -C $RepoDir apply --whitespace=nowarn $PatchFile
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply '$PatchFile' against current upstream. Regenerate it - see sdcpp-patches\$PatchSetName\README.md"
+        }
+        return
+    }
+
+    git -C $RepoDir apply --reverse --check --whitespace=nowarn $PatchFile 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  [patch:$PatchSetName] $Label already applied upstream - skipping" -ForegroundColor DarkGray
+        return
+    }
+
+    throw "Failed to apply '$PatchFile' against current upstream (neither forward nor reverse). Regenerate it - see sdcpp-patches\$PatchSetName\README.md"
+}
+
 function Invoke-SdCppPatches {
-    # Copy new sources into <clone>\src\, then git-apply each wiring.patch.
-    # A patch that fails to apply throws (loud + clear: upstream drifted and
-    # the patch must be regenerated). Run AFTER the pull / submodule sync.
+    # Copy new sources into <clone>\src\, then git-apply each wiring.patch
+    # (root) and ggml.patch (submodule). A patch that fails to apply throws
+    # (loud + clear: upstream drifted and the patch must be regenerated),
+    # UNLESS the reverse-check succeeds — in which case the patch is treated
+    # as already merged upstream and silently skipped. Run AFTER the pull /
+    # submodule sync.
     param(
         [Parameter(Mandatory)][string]$CloneDir,
         [Parameter(Mandatory)][string]$PatchRoot
@@ -83,15 +134,22 @@ function Invoke-SdCppPatches {
             }
         }
 
-        $patch = Join-Path $set.FullName 'wiring.patch'
-        if (Test-PatchHasDiff $patch) {
-            Write-Host "  [patch:$name] applying wiring.patch" -ForegroundColor Cyan
-            git -C $CloneDir apply --whitespace=nowarn $patch
-            if ($LASTEXITCODE -ne 0) {
-                throw "Failed to apply '$patch' against current upstream. Regenerate it - see sdcpp-patches\$name\README.md"
+        $wiring = Join-Path $set.FullName 'wiring.patch'
+        if (Test-PatchHasDiff $wiring) {
+            Invoke-PatchInRepo -RepoDir $CloneDir -PatchFile $wiring -Label 'wiring.patch' -PatchSetName $name
+        }
+
+        $ggml = Join-Path $set.FullName 'ggml.patch'
+        if (Test-PatchHasDiff $ggml) {
+            $ggmlRepo = Join-Path $CloneDir 'ggml'
+            if (-not (Test-Path "$ggmlRepo\.git")) {
+                throw "Patch set '$name' has ggml.patch but $ggmlRepo is not a git repo (was the submodule init'd?)"
             }
-        } else {
-            Write-Host "  [patch:$name] no wiring.patch yet (new sources copied only)" -ForegroundColor DarkGray
+            Invoke-PatchInRepo -RepoDir $ggmlRepo -PatchFile $ggml -Label 'ggml.patch' -PatchSetName $name
+        }
+
+        if (-not (Test-PatchHasDiff $wiring) -and -not (Test-PatchHasDiff $ggml) -and -not (Test-Path $srcDir)) {
+            Write-Host "  [patch:$name] no diff/sources yet (placeholder)" -ForegroundColor DarkGray
         }
     }
 }
