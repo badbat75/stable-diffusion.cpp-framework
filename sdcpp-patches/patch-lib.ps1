@@ -25,9 +25,15 @@
 # gitlink past the upstream fix.
 
 function Get-SdCppPatchSets {
+    # Each subdirectory of sdcpp-patches\ is a patch set, EXCEPT one that
+    # carries a `.disabled` marker file — those are skipped entirely (neither
+    # reset nor applied), so a patch set can be parked in the repo (kept under
+    # version control for future reference / re-enablement) without affecting
+    # the build. Drop the `.disabled` file to re-activate it.
     param([Parameter(Mandatory)][string]$PatchRoot)
     if (-not (Test-Path $PatchRoot)) { return @() }
     Get-ChildItem -Path $PatchRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-Path (Join-Path $_.FullName '.disabled')) } |
         Sort-Object Name
 }
 

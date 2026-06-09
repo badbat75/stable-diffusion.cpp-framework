@@ -218,6 +218,9 @@ function Add-BoolFlag  { param([string]$Key, [string]$Flag) if ($keys.ContainsKe
 
 Add-StringArg 'model'            '-m'
 Add-StringArg 'diffusion-model'  '--diffusion-model'
+# Ideogram4 ships a separate unconditional transformer alongside the
+# conditional one (upstream PR #1609). Both are required for the model to run.
+Add-StringArg 'uncond-diffusion-model' '--uncond-diffusion-model'
 Add-StringArg 'vae'              '--vae'
 Add-StringArg 'llm'              '--llm'
 Add-StringArg 't5xxl'            '--t5xxl'

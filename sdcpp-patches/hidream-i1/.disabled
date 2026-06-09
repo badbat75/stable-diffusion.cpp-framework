@@ -1,0 +1,8 @@
+Disabled 2026-06-09. HiDream-I1 was an experimental MMDiT port layered on top of
+the sd.cpp clone. It is parked (not applied, not built) but kept under version
+control for reference. The build now follows vanilla upstream, which natively
+supports Ideogram4 (PR leejet/stable-diffusion.cpp#1609, merged 2026-06-04) and
+no longer needs -DSD_HIDREAM_I1_EXPERIMENTAL=ON.
+
+To re-enable: delete this file. Get-SdCppPatchSets (sdcpp-patches\patch-lib.ps1)
+skips any patch-set directory that contains a `.disabled` marker.

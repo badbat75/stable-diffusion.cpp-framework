@@ -21,6 +21,7 @@ pub struct Preset {
     pub id: String,
     pub model_type: String, // "allinone" | "standalone"
     pub model: String,
+    pub uncond_diffusion_model: String,
     pub vae: String,
     pub llm: String,
     pub t5xxl: String,
@@ -51,6 +52,7 @@ impl Default for Preset {
             id: String::new(),
             model_type: String::new(),
             model: String::new(),
+            uncond_diffusion_model: String::new(),
             vae: String::new(),
             llm: String::new(),
             t5xxl: String::new(),
@@ -102,6 +104,7 @@ impl Preset {
             id: id.to_string(),
             model,
             model_type,
+            uncond_diffusion_model: get("uncond-diffusion-model"),
             vae: get("vae"),
             llm: get("llm"),
             t5xxl: get("t5xxl"),
@@ -243,6 +246,10 @@ pub fn render_section(p: &Preset) -> String {
         out.push_str("; Standalone diffusion model (--diffusion-model).\r\n");
         out.push_str(&format!("diffusion-model = {}\r\n", p.model));
     }
+    // Ideogram4: standalone unconditional transformer paired with the
+    // conditional --diffusion-model above (upstream PR #1609). Emitted only
+    // when set, so non-Ideogram presets stay byte-identical.
+    emit_str(&mut out, "uncond-diffusion-model", &p.uncond_diffusion_model);
     out.push_str("\r\n; Sub-model paths\r\n");
     emit_str(&mut out, "vae", &p.vae);
     emit_str(&mut out, "llm", &p.llm);

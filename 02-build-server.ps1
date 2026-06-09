@@ -102,29 +102,26 @@ $cmakeArgs = @(
     "-G", "Ninja"
     "-DCMAKE_BUILD_TYPE=$($cfg.BuildType)"
     "-DSD_BUILD_EXAMPLES=ON"
-    # sdcpp-patches\hidream-i1 gates its runtime branch behind this option
-    # (default OFF upstream, so vanilla sd.cpp builds stay byte-identical).
-    # The patch ships with this framework, so flip it on — without it, an
-    # I1 GGUF passes version detection but the runtime construction path
-    # is #ifdef'd out and falls through to the SD1.x else branch, which
-    # access-violates trying to read CLIP weights from HiDream tensors.
-    "-DSD_HIDREAM_I1_EXPERIMENTAL=ON"
+    # NOTE: -DSD_HIDREAM_I1_EXPERIMENTAL=ON was dropped 2026-06-09 along with
+    # disabling the sdcpp-patches\hidream-i1 set (see its .disabled marker).
+    # The build now follows vanilla upstream, which natively supports Ideogram4
+    # (leejet/stable-diffusion.cpp#1609). Re-add the flag here AND drop the
+    # patch's .disabled marker if you ever want to rebuild the HiDream-I1 port.
 )
 
 if ($cfg.SdCuda) {
     $cmakeArgs += '-DSD_CUDA=ON'
-    # Pin nvcc's host compiler to the same cl.exe that CMake picked for CXX.
-    # Belt-and-braces: ninja's direct cl.exe invocations always work because
-    # they inherit PATH from Enable-VsDevShell, but nvcc's forwarded
-    # invocation can break (`'cl.exe' is not recognized ...`) when the parent
-    # shell has accumulated env pollution from prior tool sessions — passing
-    # -ccbin via CMAKE_CUDA_HOST_COMPILER bypasses PATH discovery entirely, so
-    # the build survives a polluted shell without forcing the user to open a
-    # fresh terminal.
-    $cl = Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
-    if ($cl) {
-        $cmakeArgs += "-DCMAKE_CUDA_HOST_COMPILER=$cl"
-    }
+    # Do NOT pin nvcc's host compiler via -DCMAKE_CUDA_HOST_COMPILER.
+    # CUDA 13.x's nvcc string-compares the cl.exe it finds in PATH against the
+    # -ccbin value and aborts when they differ. CMake emits -ccbin in 8.3 SHORT
+    # form (the MSVC toolset path contains spaces) while Enable-VsDevShell puts
+    # the LONG-form cl.exe first on PATH, so pinning -ccbin self-conflicts:
+    #   nvcc fatal : cl.exe in PATH (...\14.51.36231\...) is different than one
+    #                specified with -ccbin (...\1451~1.362\...)
+    # Enable-VsDevShell already guarantees the correct cl.exe is first on PATH,
+    # so leave -ccbin unset and let nvcc discover it. If a polluted parent shell
+    # ever shadows cl.exe, re-run this script from a fresh terminal (which is
+    # what the build harness does anyway).
 } elseif ($cfg.SdVulkan) {
     $cmakeArgs += '-DSD_VULKAN=ON'
 } elseif ($cfg.SdHipblas) {
@@ -136,9 +133,16 @@ if ($cfg.SdCuda) {
 }
 
 if ($sccachePath) {
+    # sccache wraps MSVC cl.exe (C/CXX) reliably, so cache those TUs.
     $cmakeArgs += "-DCMAKE_C_COMPILER_LAUNCHER=$sccachePath"
     $cmakeArgs += "-DCMAKE_CXX_COMPILER_LAUNCHER=$sccachePath"
-    $cmakeArgs += "-DCMAKE_CUDA_COMPILER_LAUNCHER=$sccachePath"
+    # Do NOT wrap nvcc with sccache. sccache 0.15.0 mishandles nvcc's
+    # multi-phase compilation under CUDA 13.x: the per-arch .cubin that one
+    # nvcc sub-step emits isn't where the following `fatbinary` step looks for
+    # it, so every CUDA TU dies with:
+    #   fatbinary fatal : Could not open input file 'add-id.cubin'
+    # Until sccache's nvcc support catches up, compile CUDA TUs directly.
+    # (If sccache is NOT installed the build already runs uncached — same path.)
 }
 
 Write-Host "Configuring..." -ForegroundColor Cyan

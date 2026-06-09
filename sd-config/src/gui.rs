@@ -673,6 +673,9 @@ fn refresh_file_options(app: &AppWindow) {
     let form = app.get_form();
 
     let model_scan_result = model_scan::list(&models_dir, model_scan::Category::Model);
+    // Uncond diffusion model (Ideogram4) is the same kind of file as the
+    // conditional one, so it picks from the same Category::Model list.
+    let uncond_scan_result = model_scan::list(&models_dir, model_scan::Category::Model);
     let vae_scan_result = model_scan::list(&models_dir, model_scan::Category::Vae);
     let llm_scan_result = model_scan::list(&models_dir, model_scan::Category::Llm);
     let t5xxl_scan_result = model_scan::list(&models_dir, model_scan::Category::T5xxl);
@@ -688,6 +691,17 @@ fn refresh_file_options(app: &AppWindow) {
             app.set_model_labels(lbl);
             app.set_model_values(val);
             app.set_model_index(idx);
+        },
+    );
+    apply_scanned(
+        app,
+        model_scan::Category::Model,
+        uncond_scan_result,
+        form.uncond_diffusion_model.as_str(),
+        |app, lbl, val, idx| {
+            app.set_uncond_dm_labels(lbl);
+            app.set_uncond_dm_values(val);
+            app.set_uncond_dm_index(idx);
         },
     );
     apply_scanned(
@@ -825,6 +839,7 @@ fn preset_to_form(p: &presets::Preset) -> PresetForm {
         id: p.id.clone().into(),
         model: p.model.clone().into(),
         model_type: p.model_type.clone().into(),
+        uncond_diffusion_model: p.uncond_diffusion_model.clone().into(),
         vae: p.vae.clone().into(),
         llm: p.llm.clone().into(),
         t5xxl: p.t5xxl.clone().into(),
@@ -855,6 +870,7 @@ fn form_to_preset(f: &PresetForm) -> presets::Preset {
         id: f.id.to_string(),
         model_type: f.model_type.to_string(),
         model: f.model.to_string(),
+        uncond_diffusion_model: f.uncond_diffusion_model.to_string(),
         vae: f.vae.to_string(),
         llm: f.llm.to_string(),
         t5xxl: f.t5xxl.to_string(),

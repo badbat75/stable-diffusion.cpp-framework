@@ -40,6 +40,7 @@ export struct PresetForm {
     id: string,
     model: string,
     model_type: string,
+    uncond_diffusion_model: string,
     vae: string,
     llm: string,
     t5xxl: string,
@@ -272,6 +273,9 @@ export component AppWindow inherits Window {
     in-out property <[string]> model_labels;
     in-out property <[string]> model_values;
     in-out property <int> model_index: -1;
+    in-out property <[string]> uncond_dm_labels;
+    in-out property <[string]> uncond_dm_values;
+    in-out property <int> uncond_dm_index: -1;
     in-out property <[string]> vae_labels;
     in-out property <[string]> vae_values;
     in-out property <int> vae_index: -1;
@@ -674,6 +678,20 @@ export component AppWindow inherits Window {
 
                             SectionCard {
                                 heading: "Sub-model paths (only what the architecture needs)";
+                                LabeledField {
+                                    label: "Uncond DM";
+                                    ComboBox {
+                                        model: root.uncond_dm_labels;
+                                        // Ideogram4's standalone unconditional transformer
+                                        // (--uncond-diffusion-model). See model_index above for `<=>`.
+                                        current-index <=> root.uncond_dm_index;
+                                        selected(value) => {
+                                            if (self.current-index >= 0 && self.current-index < root.uncond_dm_values.length) {
+                                                root.form.uncond_diffusion_model = root.uncond_dm_values[self.current-index];
+                                            }
+                                        }
+                                    }
+                                }
                                 LabeledField {
                                     label: "VAE";
                                     ComboBox {
