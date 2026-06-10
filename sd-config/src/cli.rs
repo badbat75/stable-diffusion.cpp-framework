@@ -94,20 +94,20 @@ pub fn run(cli: Cli) -> Result<()> {
 fn run_server(c: ServerCmd) -> Result<()> {
     match c {
         ServerCmd::Show => {
-            let cfg = server_cfg::load();
+            let cfg = server_cfg::load().context("read server.ini")?;
             println!("server.ini: {}", paths::server_ini().display());
             println!("  Port:       {}", cfg.port.map_or("-".into(), |v| v.to_string()));
             println!("  Hostname:   {}", cfg.hostname.unwrap_or_else(|| "-".into()));
             println!(
                 "  Threads:    {}",
                 cfg.threads
-                    .map_or_else(|| "auto (sd-server picks physical-core count)".into(), |v| v.to_string()),
+                    .map_or_else(|| "auto (run-server.ps1 passes half the logical-core count)".into(), |v| v.to_string()),
             );
             println!("  ModelsDir:  {}", cfg.models_dir.unwrap_or_else(|| "-".into()));
             Ok(())
         }
         ServerCmd::Set(s) => {
-            let mut cfg = server_cfg::load();
+            let mut cfg = server_cfg::load().context("read server.ini")?;
             if let Some(p) = s.port {
                 cfg.port = Some(p);
             }
@@ -130,7 +130,7 @@ fn run_server(c: ServerCmd) -> Result<()> {
 fn run_preset(c: PresetCmd) -> Result<()> {
     match c {
         PresetCmd::List => {
-            let presets = presets::load_all();
+            let presets = presets::load_all().context("read presets.ini")?;
             println!("presets.ini: {}", paths::presets_ini().display());
             if presets.is_empty() {
                 println!("  (no presets defined)");
@@ -141,7 +141,7 @@ fn run_preset(c: PresetCmd) -> Result<()> {
             Ok(())
         }
         PresetCmd::Show { id } => {
-            let presets = presets::load_all();
+            let presets = presets::load_all().context("read presets.ini")?;
             let Some(p) = presets.iter().find(|p| p.id == id) else {
                 anyhow::bail!("No preset named `{id}`. Run `sd-config preset list`.");
             };

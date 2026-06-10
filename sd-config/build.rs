@@ -8,9 +8,12 @@ fn main() {
 
 #[cfg(windows)]
 fn embed_windows_resources() {
-    // Embed the .ico as the EXE's resource icon (visible in Explorer, taskbar,
-    // and Alt+Tab). winit picks this up as the default window icon on Windows
-    // too, so no extra runtime call is needed.
+    // Embed the .ico as the EXE's resource icon (Explorer, Start Menu). The
+    // live-window icon (title bar / taskbar / Alt+Tab) still needs the
+    // runtime winit set_window_icon call in gui.rs — see docs/icon-wiring.md.
+    // This also embeds the Common-Controls-v6 SxS manifest winresource emits
+    // by default, which rfd's MessageDialog requires (without it the EXE
+    // dies at load with 0xC0000139).
     let icon = "../resources/stable-diffusion.ico";
     println!("cargo:rerun-if-changed={icon}");
     let mut res = winresource::WindowsResource::new();

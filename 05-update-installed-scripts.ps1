@@ -19,7 +19,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$InstallDir = ''
+    [string]$InstallDir = '',
+    # Internal: set by the self-elevation relaunch below. Makes the elevated
+    # session transcript its output to this file so the (non-elevated) caller
+    # can print it — the elevated console window closes on exit.
+    [string]$ElevatedLog = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,21 +42,39 @@ if (-not (Test-Path -LiteralPath $InstallDir)) {
 
 # ── Self-elevate ─────────────────────────────────────────────────────
 # Program Files is admin-write. If we're not elevated, relaunch with UAC
-# and wait for the elevated pwsh to exit so the caller's window stays
-# in sync with completion. The elevated window closes on its own (no
-# -NoExit) — output is short enough to scroll back in the caller's
-# console afterward.
+# and wait for the elevated pwsh to exit. The elevated session runs in its
+# own console that closes on exit, so its output is INVISIBLE to the caller
+# — it writes a transcript to a temp file which we print here afterwards
+# (the classic failure is a locked bin\sd-config.exe while the GUI is open,
+# which would otherwise just flash a window and report a bare exit code).
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Re-launching elevated to write into $InstallDir..." -ForegroundColor Yellow
+    $elevLog = Join-Path ([IO.Path]::GetTempPath()) "sdcpp-05-update-$PID.log"
     # Start-Process -Verb RunAs goes through ShellExecute, which flattens
     # ArgumentList into one command-line string and splits on whitespace.
     # Quote paths explicitly so values with spaces (e.g. "Program Files")
     # survive as single tokens.
-    $relaunchArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -InstallDir "{1}"' -f `
-        $MyInvocation.MyCommand.Path, $InstallDir
-    $proc = Start-Process pwsh.exe -Verb RunAs -ArgumentList $relaunchArgs -PassThru -Wait
+    $relaunchArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -InstallDir "{1}" -ElevatedLog "{2}"' -f `
+        $MyInvocation.MyCommand.Path, $InstallDir, $elevLog
+    try {
+        $proc = Start-Process pwsh.exe -Verb RunAs -ArgumentList $relaunchArgs -PassThru -Wait
+    } catch {
+        Write-Host "Elevation declined — nothing copied." -ForegroundColor Yellow
+        exit 1
+    }
+    if (Test-Path -LiteralPath $elevLog) {
+        Get-Content -LiteralPath $elevLog | Write-Host
+        Remove-Item -LiteralPath $elevLog -Force -ErrorAction SilentlyContinue
+    }
     exit $proc.ExitCode
+}
+
+# Elevated session: mirror all host/error output to the caller's log file.
+# The transcript is flushed live and auto-stopped at process exit, so even a
+# terminating error (e.g. locked bin\sd-config.exe) lands in the file.
+if ($ElevatedLog) {
+    try { Start-Transcript -Path $ElevatedLog -Force | Out-Null } catch {}
 }
 
 # ── File list (mirrors 04-package.ps1 staging, minus the ggml DLLs) ──

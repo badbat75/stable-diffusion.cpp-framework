@@ -2,15 +2,21 @@
 # Requires: a successful build (02-build-server.ps1) and NSIS.
 
 . "$PSScriptRoot\common.ps1"  # loads $cfg, adds ROCm to PATH
-Enable-VsDevShell             # cmake --install needs the VS env
+Enable-VsDevShell             # convention: build/package scripts activate the VS env
 
 $ErrorActionPreference = 'Stop'
 
 # ── Resolve version from git ────────────────────────────────────────
+# Upstream `git describe` alone is ambiguous: two harness revisions built
+# against the same sd.cpp commit would produce identically-versioned
+# installers (and the upgrade prompt would claim "already installed" for a
+# different build). Append this repo's short SHA to disambiguate.
 Push-Location $cfg.StableDiffusionCppDir
 $version = (git describe --tags 2>$null) -replace '^v', ''
 if (-not $version) { $version = "0.0.0-$(git rev-parse --short HEAD)" }
 Pop-Location
+$harnessSha = (git -C $PSScriptRoot rev-parse --short HEAD 2>$null)
+if ($harnessSha) { $version = "$version+h.$($harnessSha.Trim())" }
 Write-Host "Version: $version" -ForegroundColor Cyan
 
 # ── Ensure NSIS is installed ────────────────────────────────────────
@@ -61,20 +67,19 @@ New-Item -ItemType Directory -Path $stageBin -Force | Out-Null
 Copy-Item "$srcBin\*" -Destination $stageBin -Recurse -Force
 
 # ── sd-config GUI/CLI binary ────────────────────────────────────────
-# Build it lazily if missing (mirrors how we treat sd-server.exe).
+# Always rebuild: cargo is a fast no-op when up to date, and an existence
+# check alone would silently ship a binary that predates the current Rust /
+# Slint sources. 03 throws on failure (EAP=Stop propagates it here).
 $sdConfigExe = Join-Path $PSScriptRoot "sd-config\target\release\sd-config.exe"
-if (-not (Test-Path $sdConfigExe)) {
-    Write-Host "sd-config.exe not built yet — invoking 03-build-gui.ps1..." -ForegroundColor Cyan
-    & "$PSScriptRoot\03-build-gui.ps1"
-    if ($LASTEXITCODE -ne 0) { throw "03-build-gui.ps1 failed (exit $LASTEXITCODE)" }
-}
+Write-Host "Ensuring sd-config.exe is current — invoking 03-build-gui.ps1..." -ForegroundColor Cyan
+& "$PSScriptRoot\03-build-gui.ps1"
 if (-not (Test-Path $sdConfigExe)) { throw "sd-config.exe still missing after 03-build-gui.ps1: $sdConfigExe" }
 Copy-Item $sdConfigExe -Destination $stageBin -Force
 Write-Host "Staged sd-config.exe" -ForegroundColor Cyan
 
-# Stage runtime scripts and icon. All staged flat in $stageDir — NSIS template
-# installs them into $INSTDIR side-by-side, and run-server.ps1 invokes the
-# config writers via $installDir\config-*.ps1 (flat lookup, no subdir).
+# Stage runtime scripts and icon. All staged flat in $stageDir — the NSIS
+# template installs them into $INSTDIR side-by-side (configuration is done by
+# bin\sd-config.exe, staged above).
 Copy-Item "$PSScriptRoot\resources\run-server.ps1"          -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\common-functions.ps1"    -Destination $stageDir -Force
 Copy-Item "$PSScriptRoot\resources\mcp-server.ps1"          -Destination $stageDir -Force
@@ -89,10 +94,12 @@ $outputFile    = Join-Path $outputDir $installerName
 $stageDirNsis   = $stageDir   -replace '/', '\'
 $outputFileNsis = $outputFile -replace '/', '\'
 
-$nsiContent = (Get-Content $templatePath -Raw) `
-    -replace '@VERSION@',     $version `
-    -replace '@STAGING_DIR@', $stageDirNsis `
-    -replace '@OUTPUT_FILE@', $outputFileNsis
+# .Replace() (literal) instead of -replace (regex): a `$` in the staging /
+# output path would otherwise be interpreted as a substitution group.
+$nsiContent = (Get-Content $templatePath -Raw).
+    Replace('@VERSION@',     $version).
+    Replace('@STAGING_DIR@', $stageDirNsis).
+    Replace('@OUTPUT_FILE@', $outputFileNsis)
 
 Set-Content -Path $nsiPath -Value $nsiContent -Encoding UTF8
 Write-Host "Generated: $nsiPath" -ForegroundColor Cyan

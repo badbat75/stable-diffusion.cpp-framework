@@ -17,7 +17,10 @@ sd-config/
     ├── mcp.rs                # per-client JSON edit (Claude Code / Desktop / OpenCode)
     ├── ini.rs                # INI dialect shared with common-functions.ps1
     ├── paths.rs              # resolve config files + mcp-server.ps1 location
-    └── net_ifaces.rs         # IPv4 interface enumeration for the bind-to combo
+    ├── net_ifaces.rs         # IPv4 interface enumeration for the bind-to combo
+    ├── model_scan.rs         # ModelsDir scan backing the Models-tab dropdowns
+    ├── runstate.rs           # run\sd-server.state probe for the status pill
+    └── server_version.rs     # sd-server --version probe for the header
 ```
 
 ## Dual-mode entry
@@ -42,7 +45,11 @@ other section byte-for-byte. This is the same contract the retired
 `config-model.ps1` wizard enforced: hand-edits to a section never touched by
 the current operation must survive.
 
-`server.ini` and `presets.ini` are written UTF-8 without BOM.
+`server.ini` and `presets.ini` are written UTF-8 without BOM (a leading BOM
+found on read — e.g. from a PS 5.1 `Out-File` hand-edit — is stripped and not
+re-written). Read errors other than file-not-found (invalid UTF-8, sharing
+violations) propagate to the caller instead of being treated as an empty
+file, so a save can never silently rebuild presets.ini from a single section.
 
 ## Paths resolution
 
@@ -94,8 +101,9 @@ interface IP) passes through verbatim.
 - **serde / serde_json** (`preserve_order`) — JSON IO for MCP client configs.
   `preserve_order` keeps user-authored key ordering intact across writes.
 - **anyhow** — error type for CLI/GUI flows.
-- **dirs** — cross-platform user-config directory resolution.
-- **rfd** (`common-controls-v6`, no GTK) — native Win32 file/folder dialogs.
+- **rfd** (`default-features = false`, no GTK) — native Win32 file/folder
+  dialogs. The Common-Controls-v6 manifest it needs is embedded at build time
+  by `build.rs` via winresource (see the note there), not via an rfd feature.
 - **ico** — runtime .ico parsing for the title-bar icon (see
   [icon-wiring.md](icon-wiring.md)).
 - **if-addrs** — IPv4/IPv6 interface enumeration for the bind-to combo.

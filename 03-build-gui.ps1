@@ -2,9 +2,9 @@
 #
 # Output: sd-config\target\release\sd-config.exe
 #
-# Prerequisites: a working `cargo` on PATH (rustup install stable). 04-package.ps1
-# auto-invokes this before staging if the binary is missing or older than the
-# Slint UI / Rust sources.
+# Prerequisites: a working `cargo` on PATH (rustup install stable).
+# 04-package.ps1 invokes this unconditionally before staging — cargo itself
+# is a fast no-op when the binary is already up to date.
 
 param(
     # Run `cargo build` in debug mode instead of release.

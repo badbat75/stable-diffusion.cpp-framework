@@ -54,7 +54,12 @@ function Reset-SdCppClone {
     if (Test-Path "$CloneDir\ggml\.git") {
         git -C "$CloneDir\ggml" reset --hard HEAD --quiet
     }
-    foreach ($set in Get-SdCppPatchSets $PatchRoot) {
+    # Enumerate ALL patch-set directories here, ignoring `.disabled`: the
+    # marker only gates APPLYING. Headers copied in before a set was parked
+    # are untracked, so `reset --hard` never removes them — and if upstream
+    # later adds a tracked file with the same name, the pull would fail with
+    # "untracked working tree file would be overwritten".
+    foreach ($set in (Get-ChildItem -Path $PatchRoot -Directory -ErrorAction SilentlyContinue)) {
         $srcDir = Join-Path $set.FullName 'src'
         if (-not (Test-Path $srcDir)) { continue }
         foreach ($f in Get-ChildItem -Path $srcDir -File) {
@@ -123,13 +128,22 @@ function Invoke-SdCppPatches {
     foreach ($set in Get-SdCppPatchSets $PatchRoot) {
         $name = $set.Name
 
+        $wiringFile = Join-Path $set.FullName 'wiring.patch'
+        $ggmlFile   = Join-Path $set.FullName 'ggml.patch'
+
         $baseFile = Join-Path $set.FullName 'base-commit.txt'
         if (Test-Path $baseFile) {
             $base = (Get-Content $baseFile -Raw).Trim()
-            $head = (git -C $CloneDir rev-parse HEAD).Trim()
+            # A set that only patches the ggml submodule records a ggml SHA in
+            # base-commit.txt — compare it against the SUBMODULE's HEAD, not
+            # the sd.cpp clone's, or the warning below fires on every build
+            # for a perfectly current patch.
+            $ggmlOnly = (Test-PatchHasDiff $ggmlFile) -and -not (Test-PatchHasDiff $wiringFile)
+            $headRepo = if ($ggmlOnly) { Join-Path $CloneDir 'ggml' } else { $CloneDir }
+            $head = (git -C $headRepo rev-parse HEAD).Trim()
             if ($base -and $head -and $base -ne $head) {
-                Write-Host ("  [patch:{0}] upstream HEAD {1} != patch base {2} - patch may need regeneration" -f `
-                    $name, $head.Substring(0, 10), $base.Substring(0, 10)) -ForegroundColor Yellow
+                Write-Host ("  [patch:{0}] {1} HEAD {2} != patch base {3} - patch may need regeneration" -f `
+                    $name, $(if ($ggmlOnly) { 'ggml' } else { 'upstream' }), $head.Substring(0, 10), $base.Substring(0, 10)) -ForegroundColor Yellow
             }
         }
 
@@ -140,21 +154,19 @@ function Invoke-SdCppPatches {
             }
         }
 
-        $wiring = Join-Path $set.FullName 'wiring.patch'
-        if (Test-PatchHasDiff $wiring) {
-            Invoke-PatchInRepo -RepoDir $CloneDir -PatchFile $wiring -Label 'wiring.patch' -PatchSetName $name
+        if (Test-PatchHasDiff $wiringFile) {
+            Invoke-PatchInRepo -RepoDir $CloneDir -PatchFile $wiringFile -Label 'wiring.patch' -PatchSetName $name
         }
 
-        $ggml = Join-Path $set.FullName 'ggml.patch'
-        if (Test-PatchHasDiff $ggml) {
+        if (Test-PatchHasDiff $ggmlFile) {
             $ggmlRepo = Join-Path $CloneDir 'ggml'
             if (-not (Test-Path "$ggmlRepo\.git")) {
                 throw "Patch set '$name' has ggml.patch but $ggmlRepo is not a git repo (was the submodule init'd?)"
             }
-            Invoke-PatchInRepo -RepoDir $ggmlRepo -PatchFile $ggml -Label 'ggml.patch' -PatchSetName $name
+            Invoke-PatchInRepo -RepoDir $ggmlRepo -PatchFile $ggmlFile -Label 'ggml.patch' -PatchSetName $name
         }
 
-        if (-not (Test-PatchHasDiff $wiring) -and -not (Test-PatchHasDiff $ggml) -and -not (Test-Path $srcDir)) {
+        if (-not (Test-PatchHasDiff $wiringFile) -and -not (Test-PatchHasDiff $ggmlFile) -and -not (Test-Path $srcDir)) {
             Write-Host "  [patch:$name] no diff/sources yet (placeholder)" -ForegroundColor DarkGray
         }
     }

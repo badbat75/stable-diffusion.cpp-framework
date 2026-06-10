@@ -52,9 +52,11 @@ function Get-Presets {
             $t = $line.Trim()
             if ($t -eq '' -or $t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[')) { continue }
             if ($t -match '^([^=]+?)\s*=\s*(.*)$') {
+                # Capture the key before the inline-comment match below clobbers $Matches.
+                $key = $Matches[1].Trim()
                 $val = $Matches[2].Trim()
                 if ($val -match '^(.*?)\s+[;#]\s.*$') { $val = $Matches[1].Trim() }
-                $keys[$Matches[1].Trim()] = $val
+                $keys[$key] = $val
             }
         }
         $result += [pscustomobject]@{ Id = $m.Groups['id'].Value.Trim(); Keys = $keys }
@@ -65,7 +67,7 @@ function Get-Presets {
 # Read %LOCALAPPDATA%\stable-diffusion.cpp\run\sd-server.state. Returns the
 # parsed JSON (PSCustomObject with pid/host/port/preset/server_exe/started_at)
 # or $null if the file is missing or unparseable. Caller is responsible for
-# liveness check via Get-Process -Id $state.pid — a present file does NOT
+# the liveness check (use Test-SdServerAlive) — a present file does NOT
 # guarantee sd-server is still alive (e.g. if run-server.ps1 was killed
 # uncleanly before its finally block could remove the file).
 function Read-SdServerState {
@@ -76,6 +78,26 @@ function Read-SdServerState {
     } catch {
         return $null
     }
+}
+
+# True when the state file's PID is alive AND actually is sd-server. The
+# identity check matters: after an unclean shutdown the state file outlives
+# the process, and Windows recycles PIDs aggressively — without it,
+# stop_server/switch_preset would Stop-Process -Force whatever unrelated
+# process inherited the number. Identity = the process's binary path equals
+# the state file's server_exe (recorded by run-server.ps1 at launch), with a
+# name fallback for state files written by older versions / when Path is
+# inaccessible across elevation boundaries.
+function Test-SdServerAlive {
+    param($State)
+    if (-not $State -or -not $State.pid) { return $false }
+    $p = Get-Process -Id $State.pid -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    $exePath = try { $p.Path } catch { $null }
+    if ($exePath -and $State.server_exe) {
+        return ($exePath -eq [string]$State.server_exe)
+    }
+    return ($p.ProcessName -eq 'sd-server')
 }
 
 # ── Type coercion ────────────────────────────────────────────────────

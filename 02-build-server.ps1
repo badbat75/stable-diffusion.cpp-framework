@@ -70,8 +70,9 @@ New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
 # ── sccache: use local cache if available ─────────────────────────
 # Optional compiler cache. When sccache.exe is on PATH we wire it up as a
-# CMake compiler launcher for C/CXX/CUDA — incremental rebuilds across clean
-# wipes get an ~order-of-magnitude speedup on the heavy CUDA TUs. Disabled
+# CMake compiler launcher for C/CXX only (NOT nvcc — see the launcher block
+# below) — incremental rebuilds across clean wipes get a large speedup on
+# the C/C++ TUs. Disabled
 # silently when sccache isn't installed (recommended: `winget install
 # Mozilla.sccache`). Mirrors the wiring in llama.cpp-framework\02-build.ps1.
 $sccachePath = Get-Command sccache -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
@@ -149,11 +150,20 @@ Write-Host "Configuring..." -ForegroundColor Cyan
 cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
+# Clear stale binaries before building: cmake never removes outputs that
+# upstream renamed or dropped, and 04-package.ps1 stages bin\* wholesale —
+# an orphaned exe/DLL would otherwise ship in the installer. Ninja only
+# relinks what's missing, so this costs seconds.
+$binDir = Join-Path $buildDir 'bin'
+if (Test-Path $binDir) { Remove-Item -Recurse -Force $binDir }
+
 $buildArgs = @("--build", $buildDir, "--config", $cfg.BuildType)
-if ($null -ne $env:NUMBER_OF_PROCESSORS) {
-    $cores = [int]$env:NUMBER_OF_PROCESSORS
-    if ($cores -gt 4) { $buildArgs += '-j', ([Math]::Min($cores, 16)) } else { $buildArgs += '-j' }
-}
+# Parallelism: config knob BuildJobs (written by 01-configure.ps1), falling
+# back to max(1, cores-4) — leave a few cores free for the rest of the
+# machine (same convention as llama.cpp-framework's BuildJobs).
+$jobs = if ($cfg.ContainsKey('BuildJobs') -and $cfg.BuildJobs) { [int]$cfg.BuildJobs }
+        else { [Math]::Max(1, [int]$env:NUMBER_OF_PROCESSORS - 4) }
+$buildArgs += '-j', $jobs
 
 Write-Host "Building..." -ForegroundColor Cyan
 cmake @buildArgs

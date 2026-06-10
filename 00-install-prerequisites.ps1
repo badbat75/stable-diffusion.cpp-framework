@@ -124,11 +124,22 @@ if ($blocks.Count -gt 0) {
         & ([scriptblock]::Create($script))
     } else {
         Write-Host "Requesting administrator privileges for winget..." -ForegroundColor Yellow
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
-        $proc = Start-Process powershell -Verb RunAs -Wait -PassThru `
-            -ArgumentList "-ExecutionPolicy Bypass -EncodedCommand $encoded"
-        if ($proc.ExitCode -ne 0) {
-            Write-Host "Elevated session exited with code $($proc.ExitCode)" -ForegroundColor Red
+        # Explicit `exit 0` (elevated child only): without it the session
+        # exits with the LAST winget command's code, and `winget upgrade` on
+        # an already-current package returns NO_APPLICABLE_UPGRADE
+        # (0x8A15002B) — painting a red error on every run of an up-to-date
+        # machine. The before→after report below is the source of truth.
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script + "`nexit 0"))
+        try {
+            $proc = Start-Process powershell -Verb RunAs -Wait -PassThru `
+                -ArgumentList "-ExecutionPolicy Bypass -EncodedCommand $encoded"
+            if ($proc.ExitCode -ne 0) {
+                Write-Host "Elevated session exited with code $($proc.ExitCode)" -ForegroundColor Red
+            }
+        } catch {
+            # User declined the UAC prompt — degrade gracefully so the report
+            # and recommendations below still print.
+            Write-Host "Elevation declined — winget install/upgrade skipped." -ForegroundColor Yellow
         }
     }
 }
@@ -141,13 +152,24 @@ if ($cfg -and $beforeSd) {
     # Strip sdcpp-patches\ edits so the tree is clean for --ff-only (HEAD is
     # not moved, so the before/after rebuild-detection below stays accurate).
     Reset-SdCppClone -CloneDir $cfg.StableDiffusionCppDir -PatchRoot $patchRoot
-    git -C $cfg.StableDiffusionCppDir pull --ff-only
+    # fetch + checkout master + pull (same sequence as 02-build-server.ps1)
+    # so the clone recovers even when a debug session left HEAD detached —
+    # a bare `git pull --ff-only` would fail there and the report would then
+    # show a truthless [OK] because before==after.
+    git -C $cfg.StableDiffusionCppDir fetch --tags origin
+    if ($LASTEXITCODE -eq 0) { git -C $cfg.StableDiffusionCppDir checkout --quiet master }
+    if ($LASTEXITCODE -eq 0) { git -C $cfg.StableDiffusionCppDir pull --ff-only }
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "  git pull failed in $($cfg.StableDiffusionCppDir)" -ForegroundColor Yellow
+        Write-Host "  git update failed in $($cfg.StableDiffusionCppDir)" -ForegroundColor Yellow
     }
-    # Submodules track ggml — keep them in sync after a pull.
+    # Submodules track ggml — keep them in sync after a pull. A failure here
+    # leaves ggml stale and the ggml-targeted patches would apply against the
+    # wrong base, so don't swallow it.
     if (Test-Path "$($cfg.StableDiffusionCppDir)\.gitmodules") {
         git -C $cfg.StableDiffusionCppDir submodule update --init --recursive | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  git submodule update failed in $($cfg.StableDiffusionCppDir) — ggml may be stale" -ForegroundColor Yellow
+        }
     }
     # Re-apply local patches so the clone is left in its built state.
     Invoke-SdCppPatches -CloneDir $cfg.StableDiffusionCppDir -PatchRoot $patchRoot

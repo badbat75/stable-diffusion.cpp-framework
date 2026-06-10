@@ -69,15 +69,17 @@ function Write-Log {
 # (and any port change) is picked up without restarting mcp-server.
 $srvRaw  = Read-ServerIni -Path $ServerIni
 $srvHost = if ($srvRaw['Hostname']) { $srvRaw['Hostname'] } else { 'localhost' }
-$srvPort = if ($srvRaw['Port'])     { [int]$srvRaw['Port'] } else { 1234 }
+# ConvertTo-IntOrNull instead of a [int] cast: with EAP=Stop a non-numeric
+# Port in a hand-edited server.ini would kill the whole MCP server at startup.
+$srvPort = ConvertTo-IntOrNull $srvRaw['Port']
+if ($null -eq $srvPort) { $srvPort = 1234 }
 if ($srvHost -eq '0.0.0.0') { $srvHost = '127.0.0.1' }
 $baseUrlFallback = "http://${srvHost}:${srvPort}"
 Write-Log INFO "sd-server fallback endpoint: $baseUrlFallback  (config: $ServerIni)"
 
 function Get-SdServerBaseUrl {
     $state = Read-SdServerState
-    if ($state -and $state.host -and $state.port -and $state.pid -and
-        (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+    if ($state -and $state.host -and $state.port -and (Test-SdServerAlive $state)) {
         $h = if ($state.host -eq '0.0.0.0') { '127.0.0.1' } else { [string]$state.host }
         return "http://${h}:$($state.port)"
     }
@@ -99,7 +101,18 @@ function Invoke-SdJson {
         $params.ContentType = 'application/json'
         $params.Body        = ($Body | ConvertTo-Json -Depth 100 -Compress)
     }
-    return Invoke-RestMethod @params
+    try {
+        return Invoke-RestMethod @params
+    } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+        # Surface sd-server's JSON error payload (e.g. "invalid ref_images")
+        # instead of the bare "Response status code does not indicate
+        # success" — the body is the only diagnostic sd-server gives.
+        $detail = $_.ErrorDetails.Message
+        if ($detail) {
+            throw "sd-server returned an error for $Method $Path — $($_.Exception.Message) Body: $detail"
+        }
+        throw
+    }
 }
 
 # ── Progress notifications ───────────────────────────────────────────
@@ -136,13 +149,60 @@ function Resolve-ImageArgument {
     return $Value
 }
 
+# Some models are trained exclusively on structured JSON captions —
+# currently Ideogram4 (Qwen3-VL text encoder): high_level_description /
+# style_description / compositional_deconstruction. Fed plain text their
+# conditioning goes degenerate and EVERY render comes out as a flat grey
+# "blocked" card, so generate_image fails fast and steers the caller to
+# `prompt_json` instead. Detection is name-based: /capabilities only
+# exposes the diffusion-model filename (and the state file the preset
+# id) — neither names the text encoder.
+function Test-WantsStructuredJsonPrompt {
+    $name = $null
+    try {
+        $caps = Invoke-SdJson -Method GET -Path '/sdcpp/v1/capabilities' -TimeoutSec 5
+        $name = [string]$caps.model.name
+    } catch {
+        $state = Read-SdServerState
+        if ($state) { $name = [string]$state.preset }
+    }
+    return [bool]($name -and $name -match 'ideogram')
+}
+
 function Invoke-GenerateImage {
     param([hashtable]$Arguments, $ProgressToken = $null)
 
-    if (-not $Arguments -or
-        -not $Arguments.ContainsKey('prompt') -or
-        [string]::IsNullOrWhiteSpace([string]$Arguments['prompt'])) {
-        throw "missing required argument: prompt"
+    # Prompt comes in one of two shapes: plain `prompt` (string) or
+    # `prompt_json` (object) for JSON-caption-native models. The object
+    # form is serialized compactly HERE so the client model never has to
+    # hand-escape a multi-KB JSON caption into a quoted string (same
+    # truncation risk as inline base64). prompt_json wins when both are set.
+    $promptText = $null
+    if ($Arguments -and $Arguments.ContainsKey('prompt_json') -and $null -ne $Arguments['prompt_json']) {
+        $pj = $Arguments['prompt_json']
+        if ($pj -is [string]) {
+            # Tolerate clients that pre-serialize the object themselves,
+            # but reject strings that aren't actually a JSON object —
+            # scalars like "5" or "true" parse fine yet make no caption.
+            if (-not $pj.TrimStart().StartsWith('{')) {
+                throw "prompt_json was passed as a string but it is not a JSON object (must start with '{')"
+            }
+            try { $null = $pj | ConvertFrom-Json -Depth 100 } catch {
+                throw "prompt_json was passed as a string but it is not valid JSON: $($_.Exception.Message)"
+            }
+            $promptText = $pj
+        } else {
+            $promptText = ConvertTo-Json -InputObject $pj -Depth 100 -Compress
+        }
+        Write-Log INFO ("prompt_json supplied; serialized to {0} chars" -f $promptText.Length)
+    } elseif ($Arguments -and $Arguments.ContainsKey('prompt') -and
+              -not [string]::IsNullOrWhiteSpace([string]$Arguments['prompt'])) {
+        $promptText = [string]$Arguments['prompt']
+        if (-not $promptText.TrimStart().StartsWith('{') -and (Test-WantsStructuredJsonPrompt)) {
+            throw ('the active model is trained exclusively on structured JSON captions; a plain-text prompt degenerates into a grey "blocked" card on every render. Re-call generate_image with prompt_json: an object shaped {high_level_description: string, style_description: {aesthetics, lighting, photo, medium, color_palette: ["#hex",...]}, compositional_deconstruction: {canvas, background, layout, elements: [{type: "text"|"obj", desc: string},...]}}. Write the full caption yourself: exhaustively descriptive, every object named explicitly; spell any in-image text verbatim in a "text" element.')
+        }
+    } else {
+        throw 'missing required argument: provide prompt (plain text) or prompt_json (structured caption object)'
     }
 
     # Translate flat MCP args → sd-server's nested gen_params schema.
@@ -161,7 +221,7 @@ function Invoke-GenerateImage {
     if ($guidance.Count -gt 0)                 { $sampleParams.guidance      = $guidance }
 
     $body = @{
-        prompt             = [string]$Arguments['prompt']
+        prompt             = $promptText
         width              = if ($Arguments.ContainsKey('width'))       { [int]$Arguments['width'] }       else { 1024 }
         height             = if ($Arguments.ContainsKey('height'))      { [int]$Arguments['height'] }      else { 1024 }
         batch_count        = if ($Arguments.ContainsKey('batch_count')) { [int]$Arguments['batch_count'] } else { 1 }
@@ -227,9 +287,25 @@ function Invoke-GenerateImage {
     $job         = $null
     $lastStatus  = ''
     $lastTick    = -1
+    $pollFails   = 0
     while ($true) {
         Start-Sleep -Milliseconds $PollIntervalMs
-        $job = Invoke-SdJson -Method GET -Path $pollUrl
+        # Short per-poll timeout (the default would be the full request
+        # timeout, letting one hung poll outlive the job deadline) and
+        # tolerance for transient hiccups — the job keeps rendering server-
+        # side, so aborting on a single connection reset wastes the render.
+        try {
+            $job = Invoke-SdJson -Method GET -Path $pollUrl -TimeoutSec 10
+            $pollFails = 0
+        } catch {
+            $pollFails++
+            Write-Log WARN "poll $pollFails/3 failed for job ${jobId}: $($_.Exception.Message)"
+            if ($pollFails -ge 3) {
+                try { Invoke-SdJson -Method POST -Path "$pollUrl/cancel" -TimeoutSec 10 | Out-Null } catch {}
+                throw "lost contact with sd-server while polling job $jobId (3 consecutive failures): $($_.Exception.Message)"
+            }
+            continue
+        }
 
         if ($null -ne $ProgressToken) {
             $elapsed = [int]((Get-Date) - $started).TotalSeconds
@@ -496,12 +572,18 @@ function Invoke-GetModelInfo {
     $sp = if ($d) { $d.sample_params } else { $null }
     $g  = if ($sp) { $sp.guidance } else { $null }
 
+    # Models trained only on structured JSON captions (Ideogram4) need
+    # generate_image's prompt_json instead of plain prompt — surface that
+    # so the agent discovers it BEFORE wasting a render on a grey card.
+    $wantsJson = [bool](([string]$caps.model.name) -match 'ideogram')
+
     $info = [ordered]@{
         model = [ordered]@{
             name = $caps.model.name
             stem = $caps.model.stem
             path = $caps.model.path
         }
+        prompt_format   = if ($wantsJson) { 'structured-json' } else { 'plain-text' }
         current_mode    = $caps.current_mode
         supported_modes = @($caps.supported_modes)
         features        = $caps.features
@@ -527,6 +609,9 @@ function Invoke-GetModelInfo {
         output_formats = @($caps.output_formats)
         loras    = @($caps.loras | ForEach-Object { $_.name })
     }
+    if ($wantsJson) {
+        $info.prompt_format_note = 'This model is trained exclusively on structured JSON captions: plain-text prompts degenerate into a grey "blocked" card. Call generate_image with prompt_json (a real JSON object, not an escaped string) shaped {high_level_description, style_description: {aesthetics, lighting, photo, medium, color_palette: ["#hex",...]}, compositional_deconstruction: {canvas, background, layout, elements: [{type: "text"|"obj", desc},...]}}. Be exhaustively descriptive; spell any in-image text verbatim in a "text" element.'
+    }
 
     Write-Log INFO ("get_model_info: model={0} mode={1}" -f $info.model.name, $info.current_mode)
     $json = $info | ConvertTo-Json -Depth 10
@@ -543,7 +628,9 @@ function Stop-SdServer {
     $statePath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\run\sd-server.state"
     $state = Read-SdServerState -Path $statePath
     if (-not $state -or -not $state.pid) { return $false }
-    if (-not (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+    if (-not (Test-SdServerAlive $state)) {
+        # Dead — or a recycled PID now owned by an unrelated process, which
+        # must NOT be Stop-Process'd. Either way the state file is stale.
         Remove-Item $statePath -Force -ErrorAction SilentlyContinue
         return $false
     }
@@ -647,10 +734,10 @@ function Invoke-ServerStatus {
         $result = [ordered]@{ running = $false; reason = 'no state file (sd-server is not running)' }
         return @{ content = @(@{ type = 'text'; text = ($result | ConvertTo-Json -Depth 5) }) }
     }
-    if (-not $state.pid -or -not (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+    if (-not (Test-SdServerAlive $state)) {
         $result = [ordered]@{
             running     = $false
-            reason      = "state file points at pid $($state.pid) which is no longer alive"
+            reason      = "state file points at pid $($state.pid) which is no longer alive (or is no longer sd-server)"
             stale_state = $state
         }
         return @{ content = @(@{ type = 'text'; text = ($result | ConvertTo-Json -Depth 5) }) }
@@ -688,7 +775,7 @@ function Invoke-ListPresets {
 
     $state = Read-SdServerState
     $activeId = $null
-    if ($state -and $state.pid -and (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+    if (Test-SdServerAlive $state) {
         $activeId = [string]$state.preset
     }
 
@@ -717,7 +804,7 @@ function Invoke-ListPresets {
 # ── Tool: stop_server ────────────────────────────────────────────────
 function Invoke-StopServer {
     $state = Read-SdServerState
-    if (-not $state -or -not $state.pid -or -not (Get-Process -Id $state.pid -ErrorAction SilentlyContinue)) {
+    if (-not (Test-SdServerAlive $state)) {
         Write-Log INFO "stop_server: nothing to stop"
         return @{ content = @(@{ type = 'text'; text = 'sd-server is not running. No action taken.' }) }
     }
@@ -754,7 +841,7 @@ function Invoke-SwitchPreset {
     }
 
     $current = Read-SdServerState
-    if ($current -and $current.pid -and (Get-Process -Id $current.pid -ErrorAction SilentlyContinue) -and ([string]$current.preset -eq $presetId)) {
+    if ((Test-SdServerAlive $current) -and ([string]$current.preset -eq $presetId)) {
         Write-Log INFO "switch_preset: '$presetId' already active (pid $($current.pid)); no-op"
         return @{ content = @(@{ type = 'text'; text = "Preset '$presetId' is already loaded (pid $($current.pid)). No action taken." }) }
     }
@@ -766,7 +853,7 @@ function Invoke-SwitchPreset {
     # warn so the silent fall-through to run-server.ps1's default lookup is
     # at least observable in the log.
     $inheritedExe = ''
-    if ($current -and $current.pid -and (Get-Process -Id $current.pid -ErrorAction SilentlyContinue)) {
+    if (Test-SdServerAlive $current) {
         if ($current.server_exe) {
             $inheritedExe = [string]$current.server_exe
         } else {
@@ -808,12 +895,12 @@ function Invoke-SwitchPreset {
 $Tools = @(
     @{
         name        = 'generate_image'
-        description = 'Generate an image with stable-diffusion.cpp via the local sd-server. Returns the rendered image inline as base64 (no on-disk copy). Requires sd-server to be running.'
+        description = 'Generate an image with stable-diffusion.cpp via the local sd-server. Returns the rendered image inline as base64 (no on-disk copy). Requires sd-server to be running. Exactly one of `prompt` (plain text) or `prompt_json` (structured caption object) is required — check get_model_info.prompt_format to pick: models trained on JSON captions (Ideogram4) need prompt_json and reject plain text.'
         inputSchema = @{
             type     = 'object'
-            required = @('prompt')
             properties = @{
-                prompt          = @{ type = 'string';  description = 'Positive prompt.' }
+                prompt          = @{ type = 'string';  description = 'Positive prompt, plain text. For models whose get_model_info.prompt_format is "structured-json" (Ideogram4) use prompt_json instead — a plain-text prompt makes those models render a grey "blocked" card and this tool refuses it up front.' }
+                prompt_json     = @{ type = 'object';  description = 'Structured JSON caption for caption-native models (get_model_info.prompt_format = "structured-json", currently Ideogram4). Pass a REAL JSON object — the MCP server serializes it compactly into the prompt string, so never hand-escape it into `prompt`. Shape: {high_level_description: string, style_description: {aesthetics, lighting, photo, medium, color_palette: ["#hex",...]}, compositional_deconstruction: {canvas, background, layout, elements: [{type: "text"|"obj", desc: string},...]}}. Write it exhaustively descriptive — name every object explicitly; spell any in-image text verbatim in a "text" element (these models excel at typography). Takes precedence over prompt when both are set. Harmless but pointless on plain-text models.' }
                 negative_prompt = @{ type = 'string';  description = 'Negative prompt. Note: Flux/Chroma-era models ignore this.' }
                 width           = @{ type = 'integer'; default = 1024; minimum = 64 }
                 height          = @{ type = 'integer'; default = 1024; minimum = 64 }
@@ -854,7 +941,7 @@ $Tools = @(
     },
     @{
         name        = 'get_model_info'
-        description = 'Return a curated snapshot of the model currently loaded by sd-server: name/stem/path, current mode (img_gen / vid_gen), supported features (init_image, ref_images, lora, hires, ...), the defaults that will be applied to fields you omit in generate_image (sampler, steps, txt_cfg, distilled_guidance, width/height, ...), dimension limits, and the lists of supported samplers / schedulers / output_formats / loras. Call this before generate_image when you need to know which knobs are meaningful for the active model (e.g. Flux models ignore negative_prompt, only some accept ref_images).'
+        description = 'Return a curated snapshot of the model currently loaded by sd-server: name/stem/path, prompt_format ("plain-text" or "structured-json" — the latter means generate_image needs prompt_json, not prompt), current mode (img_gen / vid_gen), supported features (init_image, ref_images, lora, hires, ...), the defaults that will be applied to fields you omit in generate_image (sampler, steps, txt_cfg, distilled_guidance, width/height, ...), dimension limits, and the lists of supported samplers / schedulers / output_formats / loras. Call this before generate_image when you need to know which knobs are meaningful for the active model (e.g. Flux models ignore negative_prompt, only some accept ref_images, Ideogram4 requires structured JSON captions).'
         inputSchema = @{
             type       = 'object'
             properties = @{}
@@ -943,6 +1030,11 @@ function Invoke-RpcRequest {
         'tools/list'                 { return New-RpcResult $id @{ tools = $Tools } }
         'tools/call' {
             $toolName = [string]$params['name']
+            # MCP: an unknown tool name is a PROTOCOL error (-32602), not a
+            # tool-execution failure — don't fold it into isError content.
+            if (@($Tools | ForEach-Object { $_.name }) -notcontains $toolName) {
+                return New-RpcError $id -32602 "unknown tool: $toolName"
+            }
             $toolArgs = @{}
             if ($params.ContainsKey('arguments') -and $params['arguments']) {
                 $toolArgs = [hashtable]$params['arguments']
@@ -977,6 +1069,11 @@ function Invoke-RpcRequest {
 # ── Main loop ────────────────────────────────────────────────────────
 Write-Log INFO "stable-diffusion-cpp MCP server starting (PID $PID)"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+# Redirected stdin defaults to the OEM codepage on Windows; the MCP client
+# sends UTF-8, so without this any non-ASCII prompt (accents, em-dashes,
+# emoji) arrives mojibake'd and is forwarded to sd-server corrupted. Guarded:
+# the setter can throw when no console is attached.
+try { [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
 $stdin  = [Console]::In
 $stdout = [Console]::Out
 
@@ -1000,7 +1097,11 @@ while ($true) {
         $resp = Invoke-RpcRequest -Request $req
     } catch {
         Write-Log ERROR "handler crashed: $($_.Exception.Message)"
-        $resp = New-RpcError $req['id'] -32603 "internal error: $($_.Exception.Message)"
+        # $req may be valid JSON yet not an object (a batch array, a scalar)
+        # — indexing it with ['id'] would throw AGAIN here and kill the
+        # whole server loop on a single malformed message.
+        $rid = if ($req -is [hashtable]) { $req['id'] } else { $null }
+        $resp = New-RpcError $rid -32603 "internal error: $($_.Exception.Message)"
     }
 
     if ($null -eq $resp) { continue }

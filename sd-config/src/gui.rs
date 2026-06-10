@@ -273,7 +273,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     // Reload sections from disk; keep the renamed preset selected
                     // by id (its index may have changed if the list was re-sorted).
-                    let all = presets::load_all();
+                    let all = match presets::load_all() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            set_status(&app, format!("Failed to re-read presets.ini: {e}"), true);
+                            return;
+                        }
+                    };
                     let summaries: Vec<PresetSummary> = all
                         .iter()
                         .map(|q| PresetSummary {
@@ -530,7 +536,13 @@ fn commit_new_preset(
 ) {
     match presets::save(&p) {
         Ok(()) => {
-            let all = presets::load_all();
+            let all = match presets::load_all() {
+                Ok(a) => a,
+                Err(e) => {
+                    set_status(app, format!("Saved, but failed to re-read presets.ini: {e}"), true);
+                    return;
+                }
+            };
             let summaries: Vec<PresetSummary> = all
                 .iter()
                 .map(|q| PresetSummary {
@@ -561,7 +573,16 @@ fn set_status(app: &AppWindow, text: String, is_error: bool) {
 }
 
 fn load_server_into_ui(app: &AppWindow) {
-    let cfg = server_cfg::load();
+    // A read failure (locked file, mangled encoding) falls back to defaults
+    // in the form, but is surfaced in the status bar — saving over a file we
+    // couldn't read would otherwise silently discard its contents.
+    let cfg = match server_cfg::load() {
+        Ok(c) => c,
+        Err(e) => {
+            set_status(app, format!("Failed to read server.ini: {e}"), true);
+            server_cfg::ServerConfig::default()
+        }
+    };
     app.set_server_port(SharedString::from(
         cfg.port.map(|v| v.to_string()).unwrap_or_else(|| "1234".into()),
     ));
@@ -621,7 +642,16 @@ fn parse_int(s: &str) -> Option<i32> {
 }
 
 fn refresh_presets(app: &AppWindow, state: &Rc<RefCell<State>>) {
-    let presets = presets::load_all();
+    let presets = match presets::load_all() {
+        Ok(p) => p,
+        Err(e) => {
+            // Show the failure instead of a silently-empty list: an empty
+            // list invites the user to re-create presets, and the next save
+            // would then clobber a file that was merely unreadable.
+            set_status(app, format!("Failed to read presets.ini: {e}"), true);
+            return;
+        }
+    };
     let summaries: Vec<PresetSummary> = presets
         .iter()
         .map(|p| PresetSummary {

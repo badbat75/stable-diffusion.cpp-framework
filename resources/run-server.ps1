@@ -55,16 +55,18 @@ $statePath   = Join-Path $runDir "sd-server.state"
 # ── Single-instance guard ────────────────────────────────────────────
 # mcp-server.ps1 (or any other consumer) reads $statePath to discover the
 # running sd-server. Refuse to start if another instance is alive; silently
-# clean up if the file is stale (PID gone).
-New-Item -ItemType Directory -Path $runDir -Force | Out-Null
-if (Test-Path $statePath) {
-    $existing = $null
-    try { $existing = Get-Content -Path $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $existing = $null }
-    if ($existing -and $existing.pid -and (Get-Process -Id $existing.pid -ErrorAction SilentlyContinue)) {
+# clean up if the file is stale (PID gone or recycled by another process —
+# Test-SdServerAlive checks process identity, not just PID existence).
+function Assert-NoLiveSdServer {
+    if (-not (Test-Path $statePath)) { return }
+    $existing = Read-SdServerState -Path $statePath
+    if (Test-SdServerAlive $existing) {
         throw "sd-server is already running (pid $($existing.pid), preset '$($existing.preset)', http://$($existing.host):$($existing.port)). Stop it before starting another instance."
     }
     Remove-Item $statePath -Force -ErrorAction SilentlyContinue
 }
+New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+Assert-NoLiveSdServer
 
 # ── server.ini ───────────────────────────────────────────────────────
 if (-not (Test-Path $serverPath)) {
@@ -362,6 +364,10 @@ $errTask = $null
 $stateWritten = $false
 $exitCode = 0
 try {
+    # Re-check the guard right before launch: the sd-config interaction and
+    # the preset picker above can hold this script open for minutes, long
+    # enough for a second invocation to have started its own sd-server.
+    Assert-NoLiveSdServer
     if (-not $proc.Start()) { throw "Failed to start sd-server.exe." }
     $outTask = [SdLogPipe]::Forward($proc.StandardOutput, $logPath, $false)
     $errTask = [SdLogPipe]::Forward($proc.StandardError,  $logPath, $true)
@@ -403,3 +409,6 @@ try {
         }
     }
 }
+# Propagate sd-server's exit code so callers (mcp-server.ps1's Start-SdServer
+# diagnostic, shell scripting) see the real outcome instead of always 0.
+exit $exitCode

@@ -21,11 +21,25 @@ pub struct Section {
     pub keys: BTreeMap<String, String>,
 }
 
+/// Read a file that may legitimately not exist yet: `NotFound` becomes an
+/// empty string, every other error (invalid UTF-8 from an ANSI hand-edit,
+/// sharing violation, permissions) propagates. Treating those as "empty"
+/// would make the write paths below silently rebuild the file from a single
+/// section, destroying every other preset — see replace_section's contract.
+/// A leading UTF-8 BOM (PS 5.1 `Out-File`, some editors) is stripped so the
+/// first `[Section]` header is recognized; writes never re-add it.
+fn read_existing(path: &Path) -> std::io::Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse all sections of an INI file. Returns sections in declaration order.
-pub fn read_all(path: &Path) -> Vec<Section> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
+/// A missing file reads as empty; any other IO error propagates.
+pub fn read_all(path: &Path) -> std::io::Result<Vec<Section>> {
+    let text = read_existing(path)?;
     let mut out: Vec<Section> = Vec::new();
     let mut cur: Option<Section> = None;
     for line in text.lines() {
@@ -56,7 +70,7 @@ pub fn read_all(path: &Path) -> Vec<Section> {
     if let Some(s) = cur {
         out.push(s);
     }
-    out
+    Ok(out)
 }
 
 fn strip_inline_comment(val: &str) -> Cow<'_, str> {
@@ -87,13 +101,13 @@ fn strip_inline_comment(val: &str) -> Cow<'_, str> {
 }
 
 /// Read only the named section's keys, or empty if not present.
-pub fn read_section(path: &Path, section: &str) -> BTreeMap<String, String> {
-    for s in read_all(path) {
+pub fn read_section(path: &Path, section: &str) -> std::io::Result<BTreeMap<String, String>> {
+    for s in read_all(path)? {
         if s.id.eq_ignore_ascii_case(section) {
-            return s.keys;
+            return Ok(s.keys);
         }
     }
-    BTreeMap::new()
+    Ok(BTreeMap::new())
 }
 
 /// Replace one key inside the named section, preserving every other line
@@ -102,7 +116,7 @@ pub fn read_section(path: &Path, section: &str) -> BTreeMap<String, String> {
 /// the end of the section.
 pub fn replace_key(path: &Path, section: &str, key: &str, value: &str) -> std::io::Result<()> {
     let new_line = format!("{key} = {value}");
-    let content = fs::read_to_string(path).unwrap_or_default();
+    let content = read_existing(path)?;
 
     let header = format!("[{section}]");
     let Some(header_pos) = find_section_header(&content, &header) else {
@@ -171,7 +185,7 @@ pub fn replace_key(path: &Path, section: &str, key: &str, value: &str) -> std::i
 pub fn replace_section(path: &Path, section_name: &str, section_body: &str) -> std::io::Result<()> {
     let header = format!("[{section_name}]");
     let new_section = ensure_trailing_newline(section_body.trim_end());
-    let content = fs::read_to_string(path).unwrap_or_default();
+    let content = read_existing(path)?;
 
     let Some(header_pos) = find_section_header(&content, &header) else {
         // Append new section
@@ -215,10 +229,7 @@ pub fn replace_section(path: &Path, section_name: &str, section_body: &str) -> s
 pub fn rename_section(path: &Path, old: &str, new: &str) -> std::io::Result<()> {
     let old_header = format!("[{old}]");
     let new_header = format!("[{new}]");
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => return Err(e),
-    };
+    let content = read_existing(path)?;
     let Some(pos) = find_section_header(&content, &old_header) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -241,10 +252,7 @@ pub fn rename_section(path: &Path, old: &str, new: &str) -> std::io::Result<()> 
 /// Remove a section entirely. No-op if missing.
 pub fn delete_section(path: &Path, section_name: &str) -> std::io::Result<()> {
     let header = format!("[{section_name}]");
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
+    let content = read_existing(path)?;
     let Some(header_pos) = find_section_header(&content, &header) else {
         return Ok(());
     };
@@ -252,11 +260,22 @@ pub fn delete_section(path: &Path, section_name: &str) -> std::io::Result<()> {
     let mut out = String::with_capacity(content.len());
     out.push_str(&content[..header_pos]);
     out.push_str(&content[next..]);
-    // Tidy: collapse multiple blank separators left behind.
-    let tidied = out
-        .replace("\r\n\r\n\r\n", "\r\n\r\n")
-        .replace("\n\n\n", "\n\n");
-    fs::write(path, tidied)
+    // Interior deletions need no tidying — the bytes on either side of the
+    // splice belong to the *surrounding* sections and must stay untouched
+    // (a whole-file blank-line collapse here would edit sections the delete
+    // never touched). Only deleting the LAST section leaves the previous
+    // separator's blank lines dangling at EOF — trim those to one newline.
+    if next >= content.len() {
+        let trimmed = out.trim_end_matches(['\r', '\n']).len();
+        if trimmed > 0 && trimmed < out.len() {
+            let ending = if out[trimmed..].contains('\r') { "\r\n" } else { "\n" };
+            out.truncate(trimmed);
+            out.push_str(ending);
+        } else if trimmed == 0 {
+            out.clear();
+        }
+    }
+    fs::write(path, out)
 }
 
 fn line_starts_with_key(line: &str, key: &str) -> bool {
@@ -276,23 +295,19 @@ fn line_starts_with_key(line: &str, key: &str) -> bool {
 }
 
 fn find_section_header(content: &str, header: &str) -> Option<usize> {
-    // Match `[Name]` at the start of a line (after \n or at offset 0).
-    let mut start = 0;
-    loop {
-        let idx = content[start..].find(header)?;
-        let abs = start + idx;
-        let prev = abs.checked_sub(1).and_then(|i| content.as_bytes().get(i));
-        let line_start = matches!(prev, None | Some(b'\n'));
-        // The header must be the entire bracketed group at line start: check
-        // the next char is the matching `]` already consumed inside `header`
-        // and the char after is end-of-line.
-        let after = content.as_bytes().get(abs + header.len());
-        let line_end = matches!(after, None | Some(b'\r') | Some(b'\n'));
-        if line_start && line_end {
-            return Some(abs);
+    // Match `[Name]` as an entire line, ASCII-case-insensitively: the read
+    // side (read_section) accepts a hand-written `[server]` for "Server", so
+    // the write side must find it too — an exact match would append a
+    // duplicate canonical-case section instead of updating in place.
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        if body.eq_ignore_ascii_case(header) {
+            return Some(offset);
         }
-        start = abs + 1;
+        offset += line.len();
     }
+    None
 }
 
 fn next_section_start(content: &str, from: usize) -> Option<usize> {
@@ -333,11 +348,131 @@ pub fn parse_float(s: &str) -> Option<f64> {
     s.trim().parse().ok()
 }
 
-/// Parse `true` / `false` (lowercase only — matches the PowerShell helper).
+/// Parse `true` / `false` case-insensitively — the PowerShell reader's
+/// `-eq 'true'` is case-insensitive, so `mmap = True` must round-trip here
+/// too instead of silently reverting to the form default on the next save.
 pub fn parse_bool(s: &str) -> Option<bool> {
-    match s.trim() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if t.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Per-test scratch file under the OS temp dir; removed on drop so
+    /// parallel test runs never collide (names embed the test's own tag).
+    struct TempIni(PathBuf);
+    impl TempIni {
+        fn new(tag: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "sd-config-ini-test-{tag}-{}.ini",
+                std::process::id()
+            ));
+            fs::write(&path, contents).unwrap();
+            TempIni(path)
+        }
+    }
+    impl Drop for TempIni {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn inline_comment_strip() {
+        assert_eq!(strip_inline_comment("30 ; high quality"), "30");
+        assert_eq!(strip_inline_comment("30 # note"), "30");
+        // `;` without surrounding whitespace is part of the value (paths).
+        assert_eq!(strip_inline_comment(r"C:\foo;bar\file"), r"C:\foo;bar\file");
+        assert_eq!(strip_inline_comment("plain"), "plain");
+    }
+
+    #[test]
+    fn bom_file_reads_and_roundtrips_without_bom() {
+        let t = TempIni::new("bom", "\u{feff}[Server]\r\nPort = 8180\r\n".as_bytes());
+        let sections = read_all(&t.0).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].id, "Server");
+        assert_eq!(sections[0].keys["Port"], "8180");
+
+        // Updating in place must hit the existing section, not append a
+        // duplicate, and the rewritten file must not carry the BOM forward.
+        replace_key(&t.0, "Server", "Port", "9999").unwrap();
+        let out = fs::read(&t.0).unwrap();
+        assert!(!out.starts_with("\u{feff}".as_bytes()));
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("[Server]").count(), 1);
+        assert!(text.contains("Port = 9999"));
+    }
+
+    #[test]
+    fn replace_section_is_case_insensitive() {
+        let t = TempIni::new("case", b"[server]\r\nPort = 1\r\n");
+        replace_section(&t.0, "Server", "[Server]\r\nPort = 2\r\n").unwrap();
+        let text = fs::read_to_string(&t.0).unwrap();
+        assert!(!text.contains("[server]"), "old lowercase header must be replaced:\n{text}");
+        assert_eq!(text.to_lowercase().matches("[server]").count(), 1);
+        assert!(text.contains("Port = 2"));
+    }
+
+    #[test]
+    fn delete_preserves_other_sections_byte_for_byte() {
+        // [a] deliberately carries a hand-kept double blank line that a
+        // whole-file tidy pass would have collapsed.
+        let a = "[a]\r\nx = 1\r\n; kept comment\r\n\r\n\r\n; second comment after 2 blanks\r\n";
+        let b = "[b]\r\ny = 2\r\n";
+        let c = "[c]\r\nz = 3\r\n";
+        let t = TempIni::new("delete", format!("{a}{b}{c}").as_bytes());
+        delete_section(&t.0, "b").unwrap();
+        let text = fs::read_to_string(&t.0).unwrap();
+        assert_eq!(text, format!("{a}{c}"));
+    }
+
+    #[test]
+    fn delete_last_section_trims_dangling_blanks() {
+        let t = TempIni::new("delete-last", b"[a]\r\nx = 1\r\n\r\n[b]\r\ny = 2\r\n");
+        delete_section(&t.0, "b").unwrap();
+        let text = fs::read_to_string(&t.0).unwrap();
+        assert_eq!(text, "[a]\r\nx = 1\r\n");
+    }
+
+    #[test]
+    fn rename_preserves_body() {
+        let body = "k = v\r\n; comment stays\r\n";
+        let t = TempIni::new("rename", format!("[old]\r\n{body}[other]\r\nq = 1\r\n").as_bytes());
+        rename_section(&t.0, "old", "new").unwrap();
+        let text = fs::read_to_string(&t.0).unwrap();
+        assert_eq!(text, format!("[new]\r\n{body}[other]\r\nq = 1\r\n"));
+        // Renaming onto an existing id must refuse.
+        let err = rename_section(&t.0, "new", "other").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn missing_file_reads_empty_but_invalid_utf8_errors() {
+        let missing = std::env::temp_dir().join(format!(
+            "sd-config-ini-test-missing-{}.ini",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&missing);
+        assert!(read_all(&missing).unwrap().is_empty());
+
+        // Invalid UTF-8 (e.g. an ANSI hand-edit with accented chars) must
+        // surface as an error — NOT as "empty file", which would let a
+        // subsequent save truncate every other preset.
+        let t = TempIni::new("badutf8", b"[Server]\r\nModelsDir = C:\\caff\xe8\r\n");
+        assert!(read_all(&t.0).is_err());
+        let before = fs::read(&t.0).unwrap();
+        assert!(replace_section(&t.0, "x", "[x]\r\nk = v\r\n").is_err());
+        // The unreadable file must be left untouched.
+        assert_eq!(fs::read(&t.0).unwrap(), before);
     }
 }

@@ -6,6 +6,7 @@
 !include "WinMessages.nsh"
 !include "LogicLib.nsh"
 !include "nsDialogs.nsh"
+!include "FileFunc.nsh"
 
 ; ── Installer metadata ──────────────────────────────────────────────
 Name "stable-diffusion.cpp @VERSION@"
@@ -18,11 +19,46 @@ SetCompressor zlib
 ; Write to the native 64-bit registry view, not Wow6432Node — otherwise
 ; PowerShell reading HKLM:\Software\stable-diffusion.cpp can't find our keys.
 ; Must be called from within a Function (not at top-level), so apply it in onInit.
+;
+; SetShellVarContext all: per-machine install, so $SMPROGRAMS must resolve to
+; the all-users Start Menu — without it the shortcuts land in the elevating
+; admin's profile and are invisible to the daily user. The few $LOCALAPPDATA
+; usages below temporarily switch back to `current` (under `all`, NSIS maps
+; $LOCALAPPDATA to ProgramData, which is never what we want).
+;
+; The previous-install check lives HERE rather than in a custom page because
+; custom page callbacks do not run in silent (/S) installs — an upgrade
+; would then skip the old uninstaller entirely and leave stale binaries in
+; $INSTDIR\bin. /SD IDYES makes silent upgrades default to uninstalling.
 Function .onInit
     SetRegView 64
+    SetShellVarContext all
+
+    ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "UninstallString"
+    StrCmp $0 "" done
+
+    ReadRegStr $1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "DisplayVersion"
+    MessageBox MB_YESNO|MB_ICONQUESTION \
+        "stable-diffusion.cpp $1 is already installed.$\n$\nUninstall the previous version before continuing?" \
+        /SD IDYES IDYES uninstall
+
+    ; User chose No — abort
+    Abort
+
+    uninstall:
+        ; Strip quotes from UninstallString
+        StrCpy $2 $0 "" 1   ; remove first char (quote)
+        StrLen $3 $2
+        IntOp $3 $3 - 1
+        StrCpy $2 $2 $3     ; remove last char (quote)
+        ExecWait '"$2" /S _?=$INSTDIR'
+        Delete "$INSTDIR\uninstall.exe"
+        RMDir "$INSTDIR"
+    done:
 FunctionEnd
 Function un.onInit
     SetRegView 64
+    SetShellVarContext all
 FunctionEnd
 
 ; ── MUI pages ───────────────────────────────────────────────────────
@@ -41,7 +77,6 @@ FunctionEnd
 !define MUI_FINISHPAGE_RUN_NOTCHECKED
 
 !insertmacro MUI_PAGE_WELCOME
-Page custom CheckPreviousInstall
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
@@ -51,31 +86,6 @@ Page custom CheckPreviousInstall
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "English"
-
-; ── Upgrade: remove previous installation silently ──────────────────
-Function CheckPreviousInstall
-    ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "UninstallString"
-    StrCmp $0 "" done
-
-    ReadRegStr $1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" "DisplayVersion"
-    MessageBox MB_YESNO|MB_ICONQUESTION \
-        "stable-diffusion.cpp $1 is already installed.$\n$\nUninstall the previous version before continuing?" \
-        IDYES uninstall
-
-    ; User chose No — abort
-    Abort
-
-    uninstall:
-        ; Strip quotes from UninstallString
-        StrCpy $2 $0 "" 1   ; remove first char (quote)
-        StrLen $3 $2
-        IntOp $3 $3 - 1
-        StrCpy $2 $2 $3     ; remove last char (quote)
-        ExecWait '"$2" /S _?=$INSTDIR'
-        Delete "$INSTDIR\uninstall.exe"
-        RMDir "$INSTDIR"
-    done:
-FunctionEnd
 
 ; ── Launch sd-config from the Finish page as the calling user ───────
 ; The installer runs elevated (RequestExecutionLevel admin) but sd-config
@@ -96,10 +106,10 @@ Section "stable-diffusion.cpp binaries (required)" SecMain
     SetOutPath "$INSTDIR\bin"
     File /r "@STAGING_DIR@\bin\*.*"
 
-    ; Runtime + init scripts. server.ini / presets.ini / MCP-client configs
-    ; are written on demand by sd-config.exe (post-install GUI) or by the
-    ; CLI flavour of the same binary. The lazy fallback in run-server.ps1
-    ; still invokes the PowerShell wizards if the user never opens the GUI.
+    ; Runtime scripts. server.ini / presets.ini / MCP-client configs are
+    ; written on demand by sd-config.exe (post-install GUI) or by the CLI
+    ; flavour of the same binary; run-server.ps1 launches bin\sd-config.exe
+    ; itself when they are missing.
     SetOutPath "$INSTDIR"
     File "@STAGING_DIR@\run-server.ps1"
     File "@STAGING_DIR@\common-functions.ps1"
@@ -123,17 +133,27 @@ Section "stable-diffusion.cpp binaries (required)" SecMain
         "NoModify" 1
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
         "NoRepair" 1
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "DisplayIcon" "$INSTDIR\stable-diffusion.ico"
+    ; EstimatedSize (KB) so Add/Remove Programs shows a real size.
+    ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\stable-diffusion.cpp" \
+        "EstimatedSize" $0
 SectionEnd
 
 ; ── Optional: Add to PATH ──────────────────────────────────────────
 Section "Add to system PATH" SecPath
-    ; Use PowerShell to safely append to PATH (idempotent)
+    ; Use PowerShell to safely append to PATH. Idempotency check compares
+    ; whole entries (split on ';'), not substrings — a -like "*$dir*" probe
+    ; would false-positive on any other entry containing the path. Single
+    ; backslash before `bin`: the doubled form wrote a literal `\\bin` into
+    ; the registry value.
     nsExec::ExecToLog 'powershell -NoProfile -Command "\
         $$regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(\
             \"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\", $$true);\
         $$path = $$regKey.GetValue(\"Path\", \"\", \"DoNotExpandEnvironmentNames\");\
-        $$dir = \"$INSTDIR\\bin\";\
-        if ($$path -notlike \"*$$dir*\") {\
+        $$dir = \"$INSTDIR\bin\";\
+        if (-not (($$path -split \";\") -contains $$dir)) {\
             $$regKey.SetValue(\"Path\", \"$$path;$$dir\", \"ExpandString\");\
         };\
         $$regKey.Close()"'
@@ -148,7 +168,11 @@ Section "Start Menu shortcuts" SecShortcuts
     ; supported by these scripts. pwsh.exe is resolved via PATH at click time.
     ; SetOutPath also becomes the shortcut's WorkingDirectory — point it at a
     ; writable per-user data dir so first-run files don't land in Program Files.
+    ; Context `current` for this one path: under `all` (set in .onInit for the
+    ; Start Menu), NSIS maps $LOCALAPPDATA to ProgramData.
+    SetShellVarContext current
     SetOutPath "$LOCALAPPDATA\stable-diffusion.cpp"
+    SetShellVarContext all
     CreateShortCut "$SMPROGRAMS\stable-diffusion.cpp\stable-diffusion.cpp.lnk" "pwsh.exe" "-NoProfile -ExecutionPolicy Bypass -File $\"$INSTDIR\run-server.ps1$\"" "$INSTDIR\stable-diffusion.ico"
     ; sd-config.exe: GUI configurator (no args) backing server.ini, presets.ini,
     ; and the MCP-client configs (Claude Code / Desktop / OpenCode). The same
@@ -174,7 +198,7 @@ Section "Uninstall"
         $$regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(\
             \"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\", $$true);\
         $$path = $$regKey.GetValue(\"Path\", \"\", \"DoNotExpandEnvironmentNames\");\
-        $$dir = \"$INSTDIR\\bin\";\
+        $$dir = \"$INSTDIR\bin\";\
         $$newPath = ($$path -split \";\" | Where-Object { $$_ -ne $$dir }) -join \";\";\
         $$regKey.SetValue(\"Path\", $$newPath, \"ExpandString\");\
         $$regKey.Close()"'
@@ -200,9 +224,12 @@ Section "Uninstall"
     ; User runtime config + per-model presets + logs.
     ; Defaults to keeping them (survives upgrade/reinstall), but ask explicitly
     ; so the user can do a clean uninstall when they want.
+    ; Context `current`: un.onInit sets `all` for $SMPROGRAMS above, but this
+    ; path must be the user profile's LOCALAPPDATA, not ProgramData.
     ; Note: uninstaller runs elevated, so $LOCALAPPDATA resolves to the
     ; elevating admin's LOCALAPPDATA — works for single-user boxes where
     ; installer and runtime user are the same account.
+    SetShellVarContext current
     StrCpy $0 "$LOCALAPPDATA\stable-diffusion.cpp"
     IfFileExists "$0\config\server.ini" 0 skip_user_data
     ; /SD IDNO: during silent uninstall (upgrade flow runs the previous

@@ -56,7 +56,11 @@ function Find-ROCm {
 
 function Find-VulkanSDK {
     if ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) { return $env:VULKAN_SDK }
-    $glslc = Get-ChildItem "${env:ProgramFiles}\VulkanSDK\*\Bin\glslc.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    # Newest SDK first — LunarG installs versions side-by-side and the
+    # default name-ascending order would pick the OLDEST one (Find-VsDevShell
+    # and Find-ROCm already sort descending for the same reason).
+    $glslc = Get-ChildItem "${env:ProgramFiles}\VulkanSDK\*\Bin\glslc.exe" -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
     if ($glslc) { return (Split-Path (Split-Path $glslc.FullName)) }
     return $null
 }
@@ -118,7 +122,10 @@ else      { Write-Host "  [--] HipPath        : not found (optional, needed for 
 if (-not $StableDiffusionCppDir) {
     $StableDiffusionCppDir = "$PSScriptRoot\build\stable-diffusion.cpp"
 }
-$val = (Resolve-Path $StableDiffusionCppDir -ErrorAction SilentlyContinue)?.Path ?? $StableDiffusionCppDir
+# GetFullPath (not Resolve-Path): the clone usually doesn't exist yet, and a
+# relative path persisted as-is into config-build.psd1 would later resolve
+# against whatever CWD 02-build-server.ps1 happens to run from.
+$val = [IO.Path]::GetFullPath($StableDiffusionCppDir, $PSScriptRoot)
 $detected.StableDiffusionCppDir = $val
 Write-Host "  [OK] StableDiffusionCppDir : $val" -ForegroundColor Green
 
@@ -202,6 +209,9 @@ $buildLines.Add("    SdHipblas             = $(Fmt $sdHipblas)")
 $buildLines.Add('')
 $buildLines.Add('    # Build settings')
 $buildLines.Add("    BuildType             = 'Release'")
+$buildLines.Add('    # Parallel build jobs for cmake --build -j. Default: cores - 4 (leave some')
+$buildLines.Add('    # headroom for the rest of the machine); raise/lower to taste.')
+$buildLines.Add("    BuildJobs             = $([Math]::Max(1, [int]$env:NUMBER_OF_PROCESSORS - 4))")
 $buildLines.Add('}')
 $buildDir = Join-Path $PSScriptRoot 'build'
 New-Item -ItemType Directory -Path $buildDir -Force | Out-Null

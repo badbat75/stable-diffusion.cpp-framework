@@ -131,12 +131,12 @@ impl Preset {
     }
 }
 
-pub fn load_all() -> Vec<Preset> {
+pub fn load_all() -> io::Result<Vec<Preset>> {
     let path = paths::presets_ini();
-    ini::read_all(&path)
+    Ok(ini::read_all(&path)?
         .into_iter()
         .map(|s| Preset::from_keys(&s.id, &s.keys))
-        .collect()
+        .collect())
 }
 
 pub fn save(preset: &Preset) -> io::Result<()> {
@@ -149,7 +149,7 @@ pub fn save(preset: &Preset) -> io::Result<()> {
     // Only seed ModelsDir in server.ini when the user hasn't picked one yet.
     // Otherwise saving a preset from a sibling folder would silently move the
     // global ModelsDir, surprising users with a multi-rooted model layout.
-    let current = server_cfg::load().models_dir.unwrap_or_default();
+    let current = server_cfg::load()?.models_dir.unwrap_or_default();
     if current.is_empty() {
         if let Some(models_dir) = infer_models_dir(&preset.model) {
             let _ = ini::replace_key(&paths::server_ini(), "Server", "ModelsDir", &models_dir);
@@ -180,13 +180,22 @@ pub fn rename(old_id: &str, new_id: &str) -> io::Result<()> {
             "new preset id is unchanged",
         ));
     }
+    // Brackets would terminate the `[id]` header early (the PS reader stops
+    // at the first `]`), newlines would split it across lines — either way
+    // the two sides of the contract would parse different presets out of the
+    // same file. Reject rather than corrupt.
+    if new.contains(['[', ']', '\r', '\n']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "preset id cannot contain '[', ']' or newlines",
+        ));
+    }
     let path = paths::presets_ini();
     ini::rename_section(&path, old_id, new)
 }
 
 /// Derive a filesystem-safe id from a model file path: basename, sans
 /// extension, sans multi-shard suffix, with non-alphanum collapsed to `_`.
-/// Matches the PS helper Get-ModelId.
 pub fn make_id(model_path: &str) -> String {
     let stem = std::path::Path::new(model_path)
         .file_stem()

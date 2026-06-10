@@ -504,7 +504,7 @@ export component AppWindow inherits Window {
                                 LineEdit {
                                     text: root.server_threads;
                                     input-type: number;
-                                    placeholder-text: "blank = half the physical-core count";
+                                    placeholder-text: "blank = half the logical-core count";
                                     edited(t) => { root.server_threads = t; }
                                 }
                             }
