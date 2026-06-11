@@ -49,6 +49,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Version reported to MCP clients in the initialize handshake. Keep in lockstep
+# with sd-config\Cargo.toml's [package] version (it leads the installer version).
+$script:McpServerVersion = '1.0.0'
+
 . (Join-Path $PSScriptRoot "common-functions.ps1")
 
 # ── Logging ──────────────────────────────────────────────────────────
@@ -1387,7 +1391,7 @@ function Invoke-RpcRequest {
             $proto = if ($params['protocolVersion']) { [string]$params['protocolVersion'] } else { '2025-06-18' }
             return New-RpcResult $id @{
                 protocolVersion = $proto
-                serverInfo      = @{ name = 'stable-diffusion-cpp'; version = '0.1.0' }
+                serverInfo      = @{ name = 'stable-diffusion-cpp'; version = $script:McpServerVersion }
                 capabilities    = @{ tools = @{} }
             }
         }

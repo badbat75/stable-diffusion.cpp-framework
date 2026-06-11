@@ -6,17 +6,32 @@ Enable-VsDevShell             # convention: build/package scripts activate the V
 
 $ErrorActionPreference = 'Stop'
 
-# ── Resolve version from git ────────────────────────────────────────
-# Upstream `git describe` alone is ambiguous: two harness revisions built
-# against the same sd.cpp commit would produce identically-versioned
-# installers (and the upgrade prompt would claim "already installed" for a
-# different build). Append this repo's short SHA to disambiguate.
+# ── Resolve version: sd-config (harness) version + upstream sd.cpp tag ──
+# The installer version leads with the sd-config crate version — this harness
+# IS versioned by sd-config (it drives run-server.ps1 / mcp-server.ps1 and the
+# GUI), so bumping sd-config\Cargo.toml is how we cut a harness release. The
+# upstream stable-diffusion.cpp tag the binaries were built from is appended so
+# the same harness over two different sd.cpp commits stays distinguishable:
+#   <sd-config version>-<sd.cpp tag>     e.g. 1.0.0-master-685-19bdfe2
+$cargoToml = Join-Path $PSScriptRoot 'sd-config\Cargo.toml'
+$sdConfigVersion = $null
+$inPackage = $false
+foreach ($line in Get-Content $cargoToml) {
+    if     ($line -match '^\s*\[package\]') { $inPackage = $true;  continue }
+    elseif ($line -match '^\s*\[')          { $inPackage = $false; continue }
+    if ($inPackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $sdConfigVersion = $Matches[1].Trim(); break }
+}
+if (-not $sdConfigVersion) { throw "Could not read [package] version from $cargoToml" }
+
+# Upstream sd.cpp tag (e.g. `master-685-19bdfe2`); fall back to the short SHA
+# if the clone has no tags reachable.
 Push-Location $cfg.StableDiffusionCppDir
-$version = (git describe --tags 2>$null) -replace '^v', ''
-if (-not $version) { $version = "0.0.0-$(git rev-parse --short HEAD)" }
+$sdcppTag = (git describe --tags 2>$null) -replace '^v', ''
+if (-not $sdcppTag) { $sdcppTag = (git rev-parse --short HEAD 2>$null) }
 Pop-Location
-$harnessSha = (git -C $PSScriptRoot rev-parse --short HEAD 2>$null)
-if ($harnessSha) { $version = "$version+h.$($harnessSha.Trim())" }
+$sdcppTag = "$sdcppTag".Trim()
+
+$version = if ($sdcppTag) { "$sdConfigVersion-$sdcppTag" } else { $sdConfigVersion }
 Write-Host "Version: $version" -ForegroundColor Cyan
 
 # ── Ensure NSIS is installed ────────────────────────────────────────

@@ -6,8 +6,10 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use slint::winit_030::{winit, WinitWindowAccessor};
+use slint::{
+    ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
+};
 #[cfg(windows)]
 use winit::platform::windows::WindowExtWindows;
 
@@ -18,28 +20,64 @@ slint::include_modules!();
 #[derive(Default)]
 struct State {
     presets: Vec<presets::Preset>,
+    // One row per LoRA of the currently-edited preset: relative path + weight.
+    // Backed by a single VecModel so per-row weight edits update in place
+    // (no `for`-rebuild that would steal LineEdit focus mid-typing); the same
+    // Rc is handed to Slint as the `lora_entries` property and read back on
+    // save by combine_lora_entries.
+    lora_model: Rc<VecModel<LoraEntry>>,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let app = AppWindow::new()?;
     let state = Rc::new(RefCell::new(State::default()));
+    // Wire the LoRA row-model into the UI before the first preset is bound.
+    app.set_lora_entries(ModelRc::from(state.borrow().lora_model.clone()));
+
+    // Surface sd-config's own crate version in the About dialog. Tracked
+    // independently of the sd-server engine version (which spawn_version_probe
+    // fills in); bumped via Cargo.toml's `version`.
+    app.set_app_version(SharedString::from(env!("CARGO_PKG_VERSION")));
 
     set_window_icon(&app);
     load_server_into_ui(&app);
-    refresh_presets(&app, &state);
+    let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+    refresh_presets(&app, &state, &scan);
     refresh_mcp(&app);
     refresh_run_status(&app);
-    refresh_file_options(&app);
+    refresh_file_options(&app, &scan);
     spawn_version_probe(app.as_weak());
 
-    app.set_presets_path(SharedString::from(paths::presets_ini().to_string_lossy().into_owned()));
+    app.set_presets_path(SharedString::from(
+        paths::presets_ini().to_string_lossy().into_owned(),
+    ));
 
     // Click on the status pill → force a re-read (also fired implicitly by
     // the 5s heartbeat below — the manual hook is for the impatient case).
     {
         let app_weak = app.as_weak();
         app.on_refresh_status(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            refresh_run_status(&app);
+        });
+    }
+
+    // App menu → "Stop Server": terminate the running sd-server, then refresh
+    // the footer pill so it flips to "stopped" without waiting for the 5s
+    // heartbeat.
+    {
+        let app_weak = app.as_weak();
+        app.on_stop_server(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            match runstate::stop() {
+                Ok(true) => set_status(&app, "Stopped sd-server".to_string(), false),
+                Ok(false) => set_status(&app, "No running sd-server to stop".to_string(), false),
+                Err(e) => set_status(&app, format!("Stop failed: {e}"), true),
+            }
             refresh_run_status(&app);
         });
     }
@@ -56,7 +94,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(5),
             move || {
-                let Some(app) = app_weak.upgrade() else { return };
+                let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
                 refresh_run_status(&app);
             },
         );
@@ -66,14 +106,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let app_weak = app.as_weak();
         app.on_save_server(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             let cfg = read_server_from_ui(&app);
             match server_cfg::save(&cfg) {
                 Ok(()) => {
-                    set_status(&app, format!("Saved {}", paths::server_ini().display()), false);
+                    set_status(
+                        &app,
+                        format!("Saved {}", paths::server_ini().display()),
+                        false,
+                    );
                     // ModelsDir may have changed → rebuild the Models-tab
                     // dropdowns so they reflect the new tree.
-                    refresh_file_options(&app);
+                    let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+                    refresh_file_options(&app, &scan);
                 }
                 Err(e) => set_status(&app, format!("Save failed: {e}"), true),
             }
@@ -82,11 +129,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let app_weak = app.as_weak();
         app.on_revert_server(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             load_server_into_ui(&app);
             // ModelsDir may have changed in memory → rebuild dropdowns so
             // the Models tab matches what's actually on disk again.
-            refresh_file_options(&app);
+            let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+            refresh_file_options(&app, &scan);
             set_status(
                 &app,
                 format!("Reloaded {}", paths::server_ini().display()),
@@ -101,7 +151,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 PathBuf::from(server_cfg::default_models_dir())
             };
-            pick_dir(&start).map(|p| SharedString::from(p.to_string_lossy().into_owned())).unwrap_or(current)
+            pick_dir(&start)
+                .map(|p| SharedString::from(p.to_string_lossy().into_owned()))
+                .unwrap_or(current)
         });
     }
 
@@ -110,14 +162,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app_weak = app.as_weak();
         let state = state.clone();
         app.on_select_preset(move |index| {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
             let st = state.borrow();
             if let Some(p) = usize::try_from(index).ok().and_then(|i| st.presets.get(i)) {
                 app.set_selected_preset_index(index);
-                app.set_form(preset_to_form(p));
+                load_preset_into_form(&app, &scan, &st.lora_model, p);
                 // Reanchor each dropdown to the newly loaded form values.
                 drop(st);
-                refresh_file_options(&app);
+                refresh_file_options(&app, &scan);
             }
         });
     }
@@ -125,8 +180,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app_weak = app.as_weak();
         let state = state.clone();
         app.on_save_preset(move || {
-            let Some(app) = app_weak.upgrade() else { return };
-            let p = form_to_preset(&app.get_form());
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+            let lora = combine_lora_entries(&scan, &state.borrow().lora_model);
+            let p = form_to_preset(&app.get_form(), lora);
             if p.id.is_empty() {
                 set_status(&app, "Preset id is empty.".into(), true);
                 return;
@@ -138,14 +197,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             match presets::save(&p) {
                 Ok(()) => {
                     set_status(&app, format!("Saved preset [{}]", p.id), false);
-                    refresh_presets(&app, &state);
+                    refresh_presets(&app, &state, &scan);
                     // Reselect the just-saved preset.
                     let st = state.borrow();
                     if let Some(i) = st.presets.iter().position(|x| x.id == p.id) {
                         app.set_selected_preset_index(i as i32);
                     }
                     drop(st);
-                    refresh_file_options(&app);
+                    refresh_file_options(&app, &scan);
                 }
                 Err(e) => set_status(&app, format!("Save failed: {e}"), true),
             }
@@ -155,18 +214,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app_weak = app.as_weak();
         let state = state.clone();
         app.on_revert_preset(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             // Re-read presets.ini from disk and reload the currently selected
             // entry into the form. If nothing is selected (i.e. a brand-new
             // draft that hasn't been saved), Revert has nothing to revert TO.
-            refresh_presets(&app, &state);
+            let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+            refresh_presets(&app, &state, &scan);
             let idx = app.get_selected_preset_index();
             let st = state.borrow();
             if let Some(p) = usize::try_from(idx).ok().and_then(|i| st.presets.get(i)) {
                 let label = p.id.clone();
-                app.set_form(preset_to_form(p));
+                load_preset_into_form(&app, &scan, &st.lora_model, p);
                 drop(st);
-                refresh_file_options(&app);
+                refresh_file_options(&app, &scan);
                 set_status(&app, format!("Reloaded [{label}] from presets.ini"), false);
             }
         });
@@ -175,17 +237,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app_weak = app.as_weak();
         let state = state.clone();
         app.on_delete_preset(move |id| {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             if id.is_empty() {
                 return;
             }
             match presets::delete(id.as_str()) {
                 Ok(()) => {
                     set_status(&app, format!("Deleted [{id}]"), false);
-                    refresh_presets(&app, &state);
+                    let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+                    refresh_presets(&app, &state, &scan);
                     app.set_selected_preset_index(-1);
-                    app.set_form(blank_form());
-                    refresh_file_options(&app);
+                    clear_preset_form(&app, &state.borrow().lora_model);
+                    refresh_file_options(&app, &scan);
                 }
                 Err(e) => set_status(&app, format!("Delete failed: {e}"), true),
             }
@@ -204,7 +269,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let pending_clone_base = pending_clone_base.clone();
         app.on_new_preset(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             let selected = {
                 let st = state.borrow();
                 let idx = app.get_selected_preset_index();
@@ -232,7 +299,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let pending_clone_base = pending_clone_base.clone();
         app.on_pick_new_empty(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             *pending_clone_base.borrow_mut() = None;
             let Some(path) = picked_dialog_model_path(&app) else {
                 set_status(&app, "Pick a model from the list first.".into(), true);
@@ -245,7 +314,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app_weak = app.as_weak();
         let state = state.clone();
         app.on_pick_new_clone(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             let Some(path) = picked_dialog_model_path(&app) else {
                 set_status(&app, "Pick a model from the list first.".into(), true);
                 return;
@@ -261,14 +332,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app_weak = app.as_weak();
         let state = state.clone();
         app.on_rename_preset(move |old_id, new_id| {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             match presets::rename(old_id.as_str(), new_id.as_str()) {
                 Ok(()) => {
-                    set_status(
-                        &app,
-                        format!("Renamed [{old_id}] → [{new_id}]"),
-                        false,
-                    );
+                    set_status(&app, format!("Renamed [{old_id}] → [{new_id}]"), false);
                     // Reload sections from disk; keep the renamed preset selected
                     // by id (its index may have changed if the list was re-sorted).
                     let all = match presets::load_all() {
@@ -295,10 +364,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let renamed = all.iter().find(|q| q.id == new_id.as_str()).cloned();
                     state.borrow_mut().presets = all;
                     app.set_selected_preset_index(new_idx);
+                    let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
                     if let Some(p) = renamed {
-                        app.set_form(preset_to_form(&p));
+                        load_preset_into_form(&app, &scan, &state.borrow().lora_model, &p);
                     }
-                    refresh_file_options(&app);
+                    refresh_file_options(&app, &scan);
                 }
                 Err(e) => set_status(&app, format!("Rename failed: {e}"), true),
             }
@@ -317,58 +387,61 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        app.on_browse_lora_file(move |current| {
-            let start = lora_browse_start(current.as_str());
-            match pick_lora_file(&start) {
-                Some(picked) => {
-                    let picked = picked.to_string_lossy().into_owned();
-                    let cur = current.trim();
-                    // sd-server resolves all of a preset's LoRAs against ONE
-                    // directory (run-server.ps1 derives it from the first
-                    // entry's parent), so a LoRA from a different folder won't
-                    // load at render time. Warn (cancellable) before appending
-                    // one whose parent differs from the LAST existing entry's.
-                    // (rfd MessageDialog is safe — the comctl6 manifest is
-                    // embedded by build.rs; see memory sd-config-manifest-comctl6.)
-                    if !cur.is_empty() {
-                        if let Some(last) = cur.rsplit(',').next() {
-                            let prev = lora_spec_dir(last.trim());
-                            let pick = PathBuf::from(&picked)
-                                .parent()
-                                .map(|p| p.to_path_buf());
-                            if let (Some(prev), Some(pick)) = (prev, pick) {
-                                if !prev.as_os_str().eq_ignore_ascii_case(pick.as_os_str()) {
-                                    let ok = rfd::MessageDialog::new()
-                                        .set_level(rfd::MessageLevel::Warning)
-                                        .set_title("LoRA is in a different folder")
-                                        .set_description(format!(
-                                            "All of a preset's LoRAs must live in one directory — sd-server \
-                                             resolves them against the first entry's folder ({}), so this file \
-                                             ({}) will not load at render time.\n\nAdd it anyway?",
-                                            prev.display(),
-                                            pick.display(),
-                                        ))
-                                        .set_buttons(rfd::MessageButtons::OkCancel)
-                                        .show();
-                                    if ok != rfd::MessageDialogResult::Ok {
-                                        return current;
-                                    }
-                                }
-                            }
+        let state = state.clone();
+        app.on_add_lora(move |picked| {
+            use slint::Model;
+            let picked = picked.trim().to_string();
+            if picked.is_empty() {
+                return;
+            }
+            let model = state.borrow().lora_model.clone();
+            // sd-server resolves all of a preset's LoRAs against ONE directory
+            // (run-server.ps1 derives it from the first entry's parent), and
+            // sub-folders ARE different directories — so a pick from another
+            // sub-folder won't load at render time. Warn (cancellable) before
+            // appending one whose sub-folder differs from the LAST row's.
+            // (rfd MessageDialog is safe — the comctl6 manifest is embedded by
+            // build.rs; see memory sd-config-manifest-comctl6.)
+            let n = model.row_count();
+            if n > 0 {
+                if let Some(last) = model.row_data(n - 1) {
+                    let prev = lora_rel_parent(last.path.as_str());
+                    let pick = lora_rel_parent(&picked);
+                    if !prev.eq_ignore_ascii_case(&pick) {
+                        let prev_disp = if prev.is_empty() { "loras root".to_string() } else { prev };
+                        let ok = rfd::MessageDialog::new()
+                            .set_level(rfd::MessageLevel::Warning)
+                            .set_title("LoRA is in a different folder")
+                            .set_description(format!(
+                                "All of a preset's LoRAs must live in one folder — sd-server resolves \
+                                 them against the first entry's folder ({}), so this file ({}) will not \
+                                 load at render time.\n\nAdd it anyway?",
+                                prev_disp, picked,
+                            ))
+                            .set_buttons(rfd::MessageButtons::OkCancel)
+                            .show();
+                        if ok != rfd::MessageDialogResult::Ok {
+                            return;
                         }
                     }
-                    // Append to the existing comma-separated list (multiplier
-                    // defaults to 1.0 and is omitted; the user can add `:0.6`
-                    // by hand). Bare full paths only — no multiplier suffix —
-                    // so the drive colon never trips the parser.
-                    let joined = if cur.is_empty() {
-                        picked
-                    } else {
-                        format!("{cur}, {picked}")
-                    };
-                    SharedString::from(joined)
                 }
-                None => current,
+            }
+            // Append a new row; weight blank = default 1.0 (user fills it in).
+            model.push(LoraEntry {
+                path: SharedString::from(picked),
+                weight: SharedString::new(),
+            });
+        });
+    }
+    {
+        let state = state.clone();
+        app.on_remove_lora(move |index| {
+            use slint::Model;
+            let model = state.borrow().lora_model.clone();
+            if let Ok(i) = usize::try_from(index) {
+                if i < model.row_count() {
+                    model.remove(i);
+                }
             }
         });
     }
@@ -377,10 +450,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let app_weak = app.as_weak();
         app.on_mcp_install(move |id| {
-            let Some(app) = app_weak.upgrade() else { return };
-            let Some(cid) = mcp::ClientId::from_str(id.as_str()) else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let Some(cid) = mcp::ClientId::from_str(id.as_str()) else {
+                return;
+            };
             match mcp::install(cid) {
-                Ok(()) => set_status(&app, format!("Installed: {}", cid.config_path().display()), false),
+                Ok(()) => set_status(
+                    &app,
+                    format!("Installed: {}", cid.config_path().display()),
+                    false,
+                ),
                 Err(e) => set_status(&app, format!("Install failed: {e:#}"), true),
             }
             refresh_mcp(&app);
@@ -389,10 +470,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let app_weak = app.as_weak();
         app.on_mcp_uninstall(move |id| {
-            let Some(app) = app_weak.upgrade() else { return };
-            let Some(cid) = mcp::ClientId::from_str(id.as_str()) else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let Some(cid) = mcp::ClientId::from_str(id.as_str()) else {
+                return;
+            };
             match mcp::uninstall(cid) {
-                Ok(()) => set_status(&app, format!("Removed: {}", cid.config_path().display()), false),
+                Ok(()) => set_status(
+                    &app,
+                    format!("Removed: {}", cid.config_path().display()),
+                    false,
+                ),
                 Err(e) => set_status(&app, format!("Uninstall failed: {e:#}"), true),
             }
             refresh_mcp(&app);
@@ -401,7 +490,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let app_weak = app.as_weak();
         app.on_mcp_refresh(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             refresh_mcp(&app);
             set_status(&app, "Re-detected.".into(), false);
         });
@@ -456,7 +547,9 @@ fn set_window_icon(app: &AppWindow) {
     let app_weak = app.as_weak();
     // Defer until app.run() has created the underlying winit window.
     slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
-        let Some(app) = app_weak.upgrade() else { return };
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
         app.window().with_winit_window(|win| {
             if let Some((rgba, w, h)) = small {
                 if let Ok(icon) = winit::window::Icon::from_rgba(rgba, w, h) {
@@ -494,50 +587,16 @@ fn pick_dir(start: &std::path::Path) -> Option<PathBuf> {
         .pick_folder()
 }
 
-fn pick_lora_file(start: &std::path::Path) -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .set_title("Pick a LoRA file")
-        .add_filter("weights", &["safetensors", "gguf"])
-        .set_directory(start)
-        .pick_file()
-}
-
-/// Strip an optional trailing `:<mult>` off one comma-separated `lora` entry,
-/// returning the bare file path. Only strips when the suffix parses as a
-/// number, so the drive colon in `E:\…` is left intact (mirrors
-/// ConvertTo-LoraEntries). Single source of truth for both the browse-start
-/// directory and the same-directory warning, so the `:<mult>` parser isn't
-/// re-implemented a third time.
-fn lora_spec_path(spec: &str) -> &str {
-    let spec = spec.trim();
-    match spec.rfind(':') {
-        Some(i) if i > 1 && spec[i + 1..].trim().parse::<f64>().is_ok() => spec[..i].trim(),
-        _ => spec,
-    }
-}
-
-/// Parent directory of a single `lora` entry (after stripping `:<mult>`), or
-/// None when the entry is empty / has no parent component.
-fn lora_spec_dir(spec: &str) -> Option<PathBuf> {
-    let path = lora_spec_path(spec);
-    if path.is_empty() {
-        return None;
-    }
-    PathBuf::from(path).parent().map(|p| p.to_path_buf())
-}
-
-/// Start directory for the LoRA file picker: the parent of the last entry
-/// already in the `lora` field (so picking a sibling LoRA — they must all
-/// share one directory — is one click), else the default ModelsDir.
-fn lora_browse_start(current: &str) -> PathBuf {
-    if let Some(last) = current.rsplit(',').next() {
-        if let Some(parent) = lora_spec_dir(last) {
-            if parent.is_dir() {
-                return parent;
-            }
-        }
-    }
-    PathBuf::from(server_cfg::default_models_dir())
+/// Sub-folder of a single relative `lora` entry (after stripping any
+/// `:<mult>`), or "" when the entry sits at the loras root. Used by the
+/// add-LoRA warning to spot a pick from a different sub-folder than the
+/// existing entries — they must all share one directory.
+fn lora_rel_parent(spec: &str) -> String {
+    let (path, _) = model_scan::split_lora_multiplier(spec);
+    std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Push the scanned model list (Category::Model under ModelsDir) into
@@ -587,7 +646,12 @@ fn run_new_empty(app: &AppWindow, state: &Rc<RefCell<State>>, path: PathBuf) {
         path.to_string_lossy().into_owned(),
         "standalone".into(),
     );
-    commit_new_preset(app, state, p, format!("Added [{id}] — tweak parameters and Save."));
+    commit_new_preset(
+        app,
+        state,
+        p,
+        format!("Added [{id}] — tweak parameters and Save."),
+    );
 }
 
 /// Clone flow: keep every field from `base` (vae, t5xxl, clip_l/g,
@@ -637,7 +701,11 @@ fn commit_new_preset(
             let all = match presets::load_all() {
                 Ok(a) => a,
                 Err(e) => {
-                    set_status(app, format!("Saved, but failed to re-read presets.ini: {e}"), true);
+                    set_status(
+                        app,
+                        format!("Saved, but failed to re-read presets.ini: {e}"),
+                        true,
+                    );
                     return;
                 }
             };
@@ -657,8 +725,9 @@ fn commit_new_preset(
                 .unwrap_or(-1);
             state.borrow_mut().presets = all;
             app.set_selected_preset_index(new_idx);
-            app.set_form(preset_to_form(&p));
-            refresh_file_options(app);
+            let scan = model_scan::LoraScan::new(app.get_server_models_dir().as_str());
+            load_preset_into_form(app, &scan, &state.borrow().lora_model, &p);
+            refresh_file_options(app, &scan);
             set_status(app, success_status, false);
         }
         Err(e) => set_status(app, format!("Save failed: {e}"), true),
@@ -682,7 +751,9 @@ fn load_server_into_ui(app: &AppWindow) {
         }
     };
     app.set_server_port(SharedString::from(
-        cfg.port.map(|v| v.to_string()).unwrap_or_else(|| "1234".into()),
+        cfg.port
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "1234".into()),
     ));
     let hostname = cfg.hostname.unwrap_or_else(|| "localhost".into());
     populate_bind_options(app, &hostname);
@@ -691,7 +762,8 @@ fn load_server_into_ui(app: &AppWindow) {
         cfg.threads.map(|v| v.to_string()).unwrap_or_default(),
     ));
     app.set_server_models_dir(SharedString::from(
-        cfg.models_dir.unwrap_or_else(server_cfg::default_models_dir),
+        cfg.models_dir
+            .unwrap_or_else(server_cfg::default_models_dir),
     ));
 }
 
@@ -739,7 +811,7 @@ fn parse_int(s: &str) -> Option<i32> {
     }
 }
 
-fn refresh_presets(app: &AppWindow, state: &Rc<RefCell<State>>) {
+fn refresh_presets(app: &AppWindow, state: &Rc<RefCell<State>>, scan: &model_scan::LoraScan) {
     let presets = match presets::load_all() {
         Ok(p) => p,
         Err(e) => {
@@ -774,36 +846,41 @@ fn refresh_presets(app: &AppWindow, state: &Rc<RefCell<State>>) {
     let len = st.presets.len() as i32;
     if prev_sel >= 0 && prev_sel < len {
         if let Some(p) = st.presets.get(prev_sel as usize) {
-            app.set_form(preset_to_form(p));
+            load_preset_into_form(app, scan, &st.lora_model, p);
         }
     } else if len > 0 {
         app.set_selected_preset_index(0);
         if let Some(p) = st.presets.first() {
-            app.set_form(preset_to_form(p));
+            load_preset_into_form(app, scan, &st.lora_model, p);
         }
     } else {
         app.set_selected_preset_index(-1);
-        app.set_form(blank_form());
+        clear_preset_form(app, &st.lora_model);
     }
 }
 
 /// Rebuild the six Models-tab dropdowns (Model / VAE / LLM / T5-XXL /
-/// CLIP-L / CLIP-G) from the current `server_models_dir` setting and the
-/// current `form` values. Cheap (a few directory reads) — safe to call on
-/// every preset switch and every save.
+/// CLIP-L / CLIP-G) plus the "+ Add a LoRA…" picker from the current
+/// `server_models_dir` setting and the current `form` values. Cheap (a few
+/// directory reads) — safe to call on every preset switch and every save.
+///
+/// `scan` is the per-event LoRA scan (see [`model_scan::LoraScan`]); its
+/// `scanned` list drives the add-LoRA dropdown directly so the (recursive)
+/// loras walk is shared with the caller's preset-load, not repeated here.
 ///
 /// CLIP-L and CLIP-G share an identical `scan_relatives` list in
 /// `model_scan::Category` (the user picks which file is L vs G out of the
 /// same `clips\` directory), so we scan once and clone the result into both
 /// dropdowns rather than walking the filesystem twice.
-fn refresh_file_options(app: &AppWindow) {
+fn refresh_file_options(app: &AppWindow, scan: &model_scan::LoraScan) {
     let models_dir = app.get_server_models_dir().to_string();
     let form = app.get_form();
 
-    let model_scan_result = model_scan::list(&models_dir, model_scan::Category::Model);
     // Uncond diffusion model (Ideogram4) is the same kind of file as the
-    // conditional one, so it picks from the same Category::Model list.
-    let uncond_scan_result = model_scan::list(&models_dir, model_scan::Category::Model);
+    // conditional one and resolves to the identical directory list, so scan
+    // Category::Model once and clone the result into both dropdowns.
+    let model_scan_result = model_scan::list(&models_dir, model_scan::Category::Model);
+    let uncond_scan_result = model_scan_result.clone();
     let vae_scan_result = model_scan::list(&models_dir, model_scan::Category::Vae);
     let llm_scan_result = model_scan::list(&models_dir, model_scan::Category::Llm);
     let t5xxl_scan_result = model_scan::list(&models_dir, model_scan::Category::T5xxl);
@@ -887,6 +964,22 @@ fn refresh_file_options(app: &AppWindow) {
             app.set_clip_g_index(idx);
         },
     );
+
+    // LoRA "Add" dropdown. Unlike the model combos this is an ACTION picker —
+    // it appends a relative path to the comma-separated `lora` field rather
+    // than tracking a current selection — so it carries labels only (no
+    // values / index). Row 0 is a sentinel so re-picking the same file still
+    // fires `selected`; the rest are paths relative to the loras root,
+    // including sub-folders. Reuses the shared `scan` so the recursive loras
+    // walk doesn't repeat the one already done for the preset-load.
+    let mut lora_labels: Vec<SharedString> = Vec::with_capacity(scan.scanned.len() + 1);
+    lora_labels.push(SharedString::from("+ Add a LoRA…"));
+    lora_labels.extend(
+        scan.scanned
+            .iter()
+            .map(|o| SharedString::from(o.label.clone())),
+    );
+    app.set_lora_labels(ModelRc::from(Rc::new(VecModel::from(lora_labels))));
 }
 
 fn apply_scanned(
@@ -898,10 +991,16 @@ fn apply_scanned(
 ) {
     let (labels, values, idx) = model_scan::build_options(category, scanned, current);
     let labels_model = ModelRc::from(Rc::new(VecModel::from(
-        labels.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+        labels
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
     )));
     let values_model = ModelRc::from(Rc::new(VecModel::from(
-        values.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+        values
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
     )));
     apply(app, labels_model, values_model, idx);
 }
@@ -915,31 +1014,33 @@ fn spawn_version_probe(app_weak: slint::Weak<AppWindow>) {
     std::thread::spawn(move || {
         let version = server_version::probe();
         slint::invoke_from_event_loop(move || {
-            let Some(app) = app_weak.upgrade() else { return };
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
             app.set_server_version(SharedString::from(version.unwrap_or_default()));
         })
         .ok();
     });
 }
 
-/// Probe `run\sd-server.state` and push the result into the header pill
-/// (green-dot + "running on host:port · preset" when alive, otherwise a
-/// neutral "not running").
+/// Probe `run\sd-server.state` and push the result into the footer pill
+/// (green dot + "started: <preset/model>" when alive, neutral "stopped"
+/// otherwise). Host/port are intentionally omitted — they live in the Server
+/// tab; the pill is a compact running/stopped indicator.
 fn refresh_run_status(app: &AppWindow) {
     match runstate::load() {
         Some(s) => {
-            let host_display = if s.host == "0.0.0.0" { "any iface" } else { s.host.as_str() };
             let text = if s.preset.is_empty() {
-                format!("sd-server: running on {}:{}", host_display, s.port)
+                "started".to_string()
             } else {
-                format!("sd-server: {} · {}:{}", s.preset, host_display, s.port)
+                format!("started: {}", s.preset)
             };
             app.set_server_running(true);
             app.set_server_status_text(SharedString::from(text));
         }
         None => {
             app.set_server_running(false);
-            app.set_server_status_text(SharedString::from("sd-server: not running"));
+            app.set_server_status_text(SharedString::from("stopped"));
         }
     }
 }
@@ -958,11 +1059,90 @@ fn refresh_mcp(app: &AppWindow) {
     app.set_mcp_clients(ModelRc::from(Rc::new(VecModel::from(list))));
 }
 
+/// Bind a preset into the editor: the scalar fields via `preset_to_form` and
+/// the LoRA rows via `set_lora_entries_from`. `scan` is the per-event LoRA scan
+/// (see [`model_scan::LoraScan`]) shared with the caller's `refresh_file_options`
+/// so the loras tree is walked once per UI event, not twice.
+fn load_preset_into_form(
+    app: &AppWindow,
+    scan: &model_scan::LoraScan,
+    lora_model: &VecModel<LoraEntry>,
+    p: &presets::Preset,
+) {
+    app.set_form(preset_to_form(p));
+    set_lora_entries_from(scan, lora_model, &p.lora);
+}
+
+/// Reset the editor to the no-preset-selected state: default scalar fields and
+/// an empty LoRA row-model.
+fn clear_preset_form(app: &AppWindow, lora_model: &VecModel<LoraEntry>) {
+    app.set_form(blank_form());
+    lora_model.set_vec(Vec::new());
+}
+
+/// Replace the LoRA row-model from a stored FULL `lora` value (`path:mult, …`).
+/// Splits it into relative paths + per-LoRA weights via lora_split_display and
+/// fills one `LoraEntry` row per LoRA. Pass an empty `full_lora` to clear.
+/// `scan` is the per-event LoRA scan (see [`model_scan::LoraScan`]).
+fn set_lora_entries_from(
+    scan: &model_scan::LoraScan,
+    model: &VecModel<LoraEntry>,
+    full_lora: &str,
+) {
+    let (paths_csv, weights_csv) = model_scan::lora_split_display(scan, full_lora);
+    let paths: Vec<&str> = if paths_csv.trim().is_empty() {
+        Vec::new()
+    } else {
+        paths_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let weights: Vec<&str> = weights_csv.split(',').map(|s| s.trim()).collect();
+    let entries: Vec<LoraEntry> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| LoraEntry {
+            path: SharedString::from(*p),
+            weight: SharedString::from(weights.get(i).copied().unwrap_or("")),
+        })
+        .collect();
+    model.set_vec(entries);
+}
+
+/// Read the LoRA row-model back into a stored FULL `lora` value. Inverse of
+/// set_lora_entries_from: recombines the rows' relative paths + weights via
+/// lora_combine_full (blank weight → default 1.0). `scan` is the per-event LoRA
+/// scan (see [`model_scan::LoraScan`]).
+fn combine_lora_entries(scan: &model_scan::LoraScan, model: &VecModel<LoraEntry>) -> String {
+    use slint::Model;
+    let n = model.row_count();
+    let mut paths: Vec<String> = Vec::with_capacity(n);
+    let mut weights: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(e) = model.row_data(i) {
+            paths.push(e.path.to_string());
+            weights.push(e.weight.to_string());
+        }
+    }
+    let paths_csv = paths.join(", ");
+    let weights_csv = if weights.iter().all(|w| w.trim().is_empty()) {
+        String::new()
+    } else {
+        weights.join(", ")
+    };
+    model_scan::lora_combine_full(scan, &paths_csv, &weights_csv)
+}
+
 fn blank_form() -> PresetForm {
     PresetForm::default()
 }
 
 fn preset_to_form(p: &presets::Preset) -> PresetForm {
+    // LoRAs are NOT carried in the form — they live in the `lora_entries`
+    // row-model (see set_lora_entries_from / combine_lora_entries), edited as
+    // one row per LoRA with its weight beside it.
     PresetForm {
         id: p.id.clone().into(),
         model: p.model.clone().into(),
@@ -973,7 +1153,6 @@ fn preset_to_form(p: &presets::Preset) -> PresetForm {
         t5xxl: p.t5xxl.clone().into(),
         clip_l: p.clip_l.clone().into(),
         clip_g: p.clip_g.clone().into(),
-        lora: p.lora.clone().into(),
         legacy_lora_dir: p.legacy_lora_dir.clone().into(),
         lora_apply_mode: p.lora_apply_mode.clone().into(),
         embd_dir: p.embd_dir.clone().into(),
@@ -986,17 +1165,29 @@ fn preset_to_form(p: &presets::Preset) -> PresetForm {
         vae_on_cpu: p.vae_on_cpu.unwrap_or(false),
         vae_tiling: p.vae_tiling.unwrap_or(false),
         max_vram: p.max_vram.map(|v| v.to_string()).unwrap_or_default().into(),
-        sampler: if p.sampler.is_empty() { "euler".into() } else { p.sampler.clone().into() },
-        flow_shift: p.flow_shift.map(|v| v.to_string()).unwrap_or_default().into(),
+        sampler: if p.sampler.is_empty() {
+            "euler".into()
+        } else {
+            p.sampler.clone().into()
+        },
+        flow_shift: p
+            .flow_shift
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+            .into(),
         steps: p.steps.unwrap_or(20),
-        cfg_scale: p.cfg_scale.map(|v| v.to_string()).unwrap_or_else(|| "7".into()).into(),
+        cfg_scale: p
+            .cfg_scale
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "7".into())
+            .into(),
         guidance: p.guidance.map(|v| v.to_string()).unwrap_or_default().into(),
         width: p.width.unwrap_or(512),
         height: p.height.unwrap_or(512),
     }
 }
 
-fn form_to_preset(f: &PresetForm) -> presets::Preset {
+fn form_to_preset(f: &PresetForm, lora: String) -> presets::Preset {
     presets::Preset {
         id: f.id.to_string(),
         model_type: f.model_type.to_string(),
@@ -1007,7 +1198,9 @@ fn form_to_preset(f: &PresetForm) -> presets::Preset {
         t5xxl: f.t5xxl.to_string(),
         clip_l: f.clip_l.to_string(),
         clip_g: f.clip_g.to_string(),
-        lora: f.lora.to_string(),
+        // Combined from the `lora_entries` row-model by the caller (see
+        // combine_lora_entries) — the form no longer carries LoRA paths.
+        lora,
         legacy_lora_dir: f.legacy_lora_dir.to_string(),
         lora_apply_mode: f.lora_apply_mode.to_string(),
         embd_dir: f.embd_dir.to_string(),
@@ -1038,4 +1231,3 @@ fn parse_float_opt(s: &str) -> Option<f64> {
         s.parse().ok()
     }
 }
-

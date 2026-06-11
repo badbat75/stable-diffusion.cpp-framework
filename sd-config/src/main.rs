@@ -6,7 +6,10 @@
 // Suppress the console window in release on Windows when launched as GUI;
 // when launched with CLI args we attach to the parent console manually.
 
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod cli;
 mod gui;

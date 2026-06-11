@@ -19,8 +19,8 @@ sd-config/
     ├── paths.rs              # resolve config files + mcp-server.ps1 location
     ├── net_ifaces.rs         # IPv4 interface enumeration for the bind-to combo
     ├── model_scan.rs         # ModelsDir scan backing the Models-tab dropdowns
-    ├── runstate.rs           # run\sd-server.state probe for the status pill
-    └── server_version.rs     # sd-server --version probe for the header
+    ├── runstate.rs           # run\sd-server.state probe (footer pill) + Stop Server action
+    └── server_version.rs     # sd-server --version probe for the About dialog
 ```
 
 ## Dual-mode entry

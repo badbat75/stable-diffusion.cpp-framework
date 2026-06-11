@@ -96,14 +96,25 @@ fn run_server(c: ServerCmd) -> Result<()> {
         ServerCmd::Show => {
             let cfg = server_cfg::load().context("read server.ini")?;
             println!("server.ini: {}", paths::server_ini().display());
-            println!("  Port:       {}", cfg.port.map_or("-".into(), |v| v.to_string()));
-            println!("  Hostname:   {}", cfg.hostname.unwrap_or_else(|| "-".into()));
+            println!(
+                "  Port:       {}",
+                cfg.port.map_or("-".into(), |v| v.to_string())
+            );
+            println!(
+                "  Hostname:   {}",
+                cfg.hostname.unwrap_or_else(|| "-".into())
+            );
             println!(
                 "  Threads:    {}",
-                cfg.threads
-                    .map_or_else(|| "auto (run-server.ps1 passes half the logical-core count)".into(), |v| v.to_string()),
+                cfg.threads.map_or_else(
+                    || "auto (run-server.ps1 passes half the logical-core count)".into(),
+                    |v| v.to_string()
+                ),
             );
-            println!("  ModelsDir:  {}", cfg.models_dir.unwrap_or_else(|| "-".into()));
+            println!(
+                "  ModelsDir:  {}",
+                cfg.models_dir.unwrap_or_else(|| "-".into())
+            );
             Ok(())
         }
         ServerCmd::Set(s) => {
@@ -170,7 +181,10 @@ fn run_mcp(c: McpCmd) -> Result<()> {
             }
             Ok(())
         }
-        McpCmd::Install { client, config_path } => {
+        McpCmd::Install {
+            client,
+            config_path,
+        } => {
             let ids = expand_client_arg(&client);
             for id in ids {
                 if let Some(p) = config_path.as_ref() {
@@ -178,7 +192,11 @@ fn run_mcp(c: McpCmd) -> Result<()> {
                     println!("Installed {} into {}", id.id_str(), p.display());
                 } else {
                     mcp::install(id)?;
-                    println!("Installed {} into {}", id.id_str(), id.config_path().display());
+                    println!(
+                        "Installed {} into {}",
+                        id.id_str(),
+                        id.config_path().display()
+                    );
                 }
             }
             Ok(())
@@ -187,7 +205,11 @@ fn run_mcp(c: McpCmd) -> Result<()> {
             let ids = expand_client_arg(&client);
             for id in ids {
                 mcp::uninstall(id)?;
-                println!("Removed {} entry from {}", id.id_str(), id.config_path().display());
+                println!(
+                    "Removed {} entry from {}",
+                    id.id_str(),
+                    id.config_path().display()
+                );
             }
             Ok(())
         }

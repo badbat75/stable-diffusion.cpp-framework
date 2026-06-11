@@ -42,11 +42,15 @@ pub fn list_options() -> Vec<BindOption> {
 
     // Stable order: by adapter name, then by IP within an adapter.
     ifaces.sort_by(|a, b| {
-        a.name.cmp(&b.name).then_with(|| a.ip().to_string().cmp(&b.ip().to_string()))
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.ip().to_string().cmp(&b.ip().to_string()))
     });
 
     for iface in ifaces {
-        let if_addrs::IfAddr::V4(v4) = iface.addr else { continue };
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            continue;
+        };
         if v4.ip.is_loopback() || v4.ip.is_link_local() {
             continue;
         }
@@ -59,7 +63,10 @@ pub fn list_options() -> Vec<BindOption> {
             net = network,
             prefix = prefix,
         );
-        out.push(BindOption { label, value: v4.ip.to_string() });
+        out.push(BindOption {
+            label,
+            value: v4.ip.to_string(),
+        });
     }
 
     out

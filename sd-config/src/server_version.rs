@@ -78,7 +78,10 @@ mod tests {
 
     #[test]
     fn keeps_unknown_format_verbatim() {
-        assert_eq!(parse("custom-build-1.2.3\n").as_deref(), Some("custom-build-1.2.3"));
+        assert_eq!(
+            parse("custom-build-1.2.3\n").as_deref(),
+            Some("custom-build-1.2.3")
+        );
     }
 
     #[test]

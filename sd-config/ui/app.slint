@@ -1,15 +1,18 @@
 // stable-diffusion.cpp configurator — Slint UI.
 //
-// Windows-11-Settings-style chrome: top header strip (app icon + name + live
-// sd-server status pill) over a left navigation rail (Server / Models / MCP)
-// and a content area that swaps pages via `current_tab`. Sections inside each
-// page are rounded "cards" rather than stock GroupBoxes so the result reads
-// like a modern WinUI app rather than a bare widget dump.
+// Windows-11-Settings-style chrome: a left navigation rail (Server / Models /
+// MCP) and a content area that swaps pages via `current_tab`. There is no top
+// header — the live sd-server status pill sits in the always-on footer status
+// bar (bottom-right, beside the action-result toast), and the app icon in the
+// top-right corner opens a small overflow menu whose "About" item shows
+// project info + the sd-server engine version. Sections inside each page are
+// rounded "cards" rather than stock GroupBoxes so the result reads like a
+// modern WinUI app rather than a bare widget dump.
 //
 // All persistence still flows through the same Rust modules the CLI uses
-// (server_cfg / presets / mcp). The visual restructure intentionally kept
-// every property name and callback signature so gui.rs needed no rewiring
-// beyond the new status-pill bindings.
+// (server_cfg / presets / mcp). Property names and callback signatures are
+// unchanged so gui.rs needs no rewiring (the About menu / dialog are driven by
+// the self-contained `show_app_menu` / `show_about_dialog` UI flags).
 //
 // Slint can't bind a `let` in a callback body, so file-picker callbacks take
 // the current value and return the new value (= the dialog result, or the
@@ -34,6 +37,15 @@ export struct PresetSummary {
     model_type: string,
 }
 
+// One LoRA row in the Models-tab editor: a path RELATIVE to the loras root
+// (display label) and its per-LoRA weight ("" = 1.0). The list is the
+// `lora_entries` property; gui.rs splits it out of / recombines it into the
+// stored `path:mult` form (model_scan::lora_split_display / lora_combine_full).
+export struct LoraEntry {
+    path: string,
+    weight: string,
+}
+
 // Form-state of the currently edited preset. Mirrors the keys
 // the renderer in presets.rs writes into presets.ini.
 export struct PresetForm {
@@ -46,7 +58,7 @@ export struct PresetForm {
     t5xxl: string,
     clip_l: string,
     clip_g: string,
-    lora: string,
+    // LoRAs are edited separately (the `lora_entries` row-model), NOT here.
     // Pre-rename lora-model-dir passthrough — round-tripped only, NO widget;
     // see Preset::legacy_lora_dir in presets.rs.
     legacy_lora_dir: string,
@@ -125,8 +137,9 @@ component NavItem inherits Rectangle {
     }
 }
 
-// The header status pill. Green when sd-server is alive, neutral otherwise.
-// Click to force-refresh the underlying state-file probe.
+// The live sd-server status pill (lives in the footer status bar). Green when
+// sd-server is alive, neutral otherwise. Click to force-refresh the underlying
+// state-file probe.
 component StatusPill inherits Rectangle {
     in property <bool> running;
     in property <string> text;
@@ -141,13 +154,19 @@ component StatusPill inherits Rectangle {
         : Palette.alternate-background;
 
     HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 14px;
+        padding-left: 14px;
+        padding-right: 12px;
         spacing: 8px;
         alignment: start;
 
-        // Status dot. Wrap in a column so we get true vertical centering
-        // inside the layout, regardless of text baseline.
+        Text {
+            text: root.text;
+            color: Palette.foreground;
+            vertical-alignment: center;
+            font-size: 12px;
+        }
+        // Status dot on the trailing edge. Wrap in a column for true vertical
+        // centering regardless of text baseline.
         VerticalLayout {
             alignment: center;
             Rectangle {
@@ -156,12 +175,6 @@ component StatusPill inherits Rectangle {
                 border-radius: 4.5px;
                 background: root.running ? #2e7d32 : #888888;
             }
-        }
-        Text {
-            text: root.text;
-            color: Palette.foreground;
-            vertical-alignment: center;
-            font-size: 12px;
         }
     }
 
@@ -242,11 +255,15 @@ export component AppWindow inherits Window {
     // ── Header / live status ─────────────────────────────────────────
     // Driven by gui.rs reading run\sd-server.state on a 2s Timer.
     in property <bool> server_running: false;
-    in property <string> server_status_text: "sd-server: not running";
+    in property <string> server_status_text: "stopped";
     // Output of `sd-server.exe --version`, parsed down to just the version
     // tag (e.g. "master-596-90e87bc"). Empty until gui::spawn_version_probe
     // finishes — the header hides the chip until then.
     in property <string> server_version: "";
+    // sd-config's own version, from CARGO_PKG_VERSION (set by gui::run).
+    // Surfaced in the About dialog so users can report which configurator
+    // build they're on independently of the sd-server engine version.
+    in property <string> app_version: "";
 
     // ── Server tab state ─────────────────────────────────────────────
     in-out property <string> server_port: "1234";
@@ -296,6 +313,14 @@ export component AppWindow inherits Window {
     in-out property <[string]> clip_g_labels;
     in-out property <[string]> clip_g_values;
     in-out property <int> clip_g_index: -1;
+    // LoRA "Add" dropdown — labels only (relative paths under the loras root,
+    // incl. sub-folders, with a sentinel row at index 0). It's an action
+    // picker that appends a row to `lora_entries`, so unlike the model combos
+    // it tracks no current selection and needs no parallel `values` / `index`.
+    in-out property <[string]> lora_labels;
+    // The editable LoRA rows of the current preset (path + weight each). Driven
+    // by a Rust-side VecModel so per-row weight edits mutate in place.
+    in-out property <[LoraEntry]> lora_entries;
 
     // ── MCP tab state ────────────────────────────────────────────────
     in-out property <[McpClient]> mcp_clients;
@@ -321,6 +346,15 @@ export component AppWindow inherits Window {
     in-out property <string> rename_old_id: "";
     in-out property <string> rename_new_id: "";
 
+    // ── App menu / About dialog ─────────────────────────────────────
+    // The top-right app-icon button opens a small overflow menu
+    // (`show_app_menu`); its "About" item opens the About modal
+    // (`show_about_dialog`), which surfaces project info + the sd-server
+    // engine version (`server_version`). Both are self-contained UI flags —
+    // no Rust wiring beyond the version probe that already feeds the header.
+    in-out property <bool> show_app_menu: false;
+    in-out property <bool> show_about_dialog: false;
+
     // ── Status / toast ───────────────────────────────────────────────
     in-out property <string> status_text: "";
     in-out property <bool> status_is_error: false;
@@ -339,74 +373,26 @@ export component AppWindow inherits Window {
     callback pick_new_clone();
     callback rename_preset(string, string);
     callback browse_dir(string, string) -> string;
-    // Picks a single LoRA file and appends it (as a full path) to the current
-    // comma-separated `lora` value; returns the new value (or unchanged on cancel).
-    callback browse_lora_file(string) -> string;
+    // Append a scanned (relative) LoRA as a new row in `lora_entries` (weight
+    // defaults to blank = 1.0), warning first when it lives in a different
+    // sub-folder than the existing rows. No-op if the warning is cancelled.
+    callback add_lora(string);
+    // Drop the LoRA row at the given index from `lora_entries`.
+    callback remove_lora(int);
 
     callback mcp_install(string);
     callback mcp_uninstall(string);
     callback mcp_refresh();
 
     callback refresh_status();
+    callback stop_server();
 
     VerticalLayout {
         spacing: 0px;
 
-        // ─── Header ─────────────────────────────────────────────────
-        Rectangle {
-            height: 56px;
-            background: Palette.alternate-background;
-            // Bottom hairline divider.
-            Rectangle {
-                y: parent.height - 1px;
-                height: 1px;
-                background: Palette.border;
-            }
-
-            HorizontalLayout {
-                padding-left: 20px;
-                padding-right: 20px;
-                spacing: 12px;
-                alignment: stretch;
-
-                VerticalLayout {
-                    alignment: center;
-                    Image {
-                        source: root.window_icon;
-                        width: 28px;
-                        height: 28px;
-                        image-fit: contain;
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 1;
-                    Text {
-                        text: "stable-diffusion.cpp";
-                        font-size: 15px;
-                        font-weight: 600;
-                        color: Palette.foreground;
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    StatusPill {
-                        running: root.server_running;
-                        text: root.server_status_text;
-                        clicked => { root.refresh_status(); }
-                    }
-                    if root.server_version != "" : Text {
-                        text: root.server_version;
-                        font-size: 10px;
-                        color: Palette.foreground.transparentize(0.55);
-                        horizontal-alignment: right;
-                    }
-                }
-            }
-        }
-
         // ─── Body: nav rail | content ─────────────────────────────
+        // (No top header — the app icon / About menu floats top-right and the
+        // sd-server status pill moved into the footer status bar below.)
         HorizontalLayout {
             spacing: 0px;
             vertical-stretch: 1;
@@ -461,6 +447,10 @@ export component AppWindow inherits Window {
 
                 // ─────────────── Page 0: Server ───────────────
                 if root.current_tab == 0 : ScrollView {
+                    // Pin the content width to the visible area so cards/fields
+                    // never extend under (or past) the vertical scrollbar; the
+                    // 24px padding then becomes the scrollbar gutter.
+                    viewport-width: self.visible-width;
                     VerticalLayout {
                         padding: 24px;
                         spacing: 16px;
@@ -638,6 +628,9 @@ export component AppWindow inherits Window {
                     // Right column: editor.
                     ScrollView {
                         horizontal-stretch: 1;
+                        // Keep the editor content within the visible width so it
+                        // doesn't slide under the vertical scrollbar.
+                        viewport-width: self.visible-width;
                         VerticalLayout {
                             padding-left: 4px;
                             padding-right: 4px;
@@ -762,16 +755,67 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 LabeledField {
-                                    label: "LoRA files";
-                                    LineEdit {
-                                        text: root.form.lora;
-                                        placeholder-text: "full path(s), optional :multiplier, comma-separated";
-                                        edited(t) => { root.form.lora = t; }
+                                    label: "LoRAs";
+                                    // One row per LoRA: relative path, its weight to the RIGHT, and a
+                                    // remove button. The "+ Add a LoRA…" picker sits BELOW the rows.
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        if root.lora_entries.length > 0 : HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: "file";
+                                                horizontal-stretch: 1;
+                                                font-size: 11px;
+                                                color: Palette.foreground.transparentize(0.45);
+                                            }
+                                            Text {
+                                                text: "weight";
+                                                width: 90px;
+                                                font-size: 11px;
+                                                color: Palette.foreground.transparentize(0.45);
+                                            }
+                                            Rectangle { width: 28px; }
+                                        }
+                                        for entry[i] in root.lora_entries : HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: entry.path;
+                                                horizontal-stretch: 1;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            LineEdit {
+                                                width: 90px;
+                                                text: entry.weight;
+                                                placeholder-text: "1.0";
+                                                // Mutates the row in the backing VecModel in place;
+                                                // read back on save by combine_lora_entries.
+                                                edited(t) => { root.lora_entries[i].weight = t; }
+                                            }
+                                            Button {
+                                                width: 28px;
+                                                // U+00D7 (×) — in the default UI font, unlike U+2715
+                                                // (✕) which rendered as a tofu box.
+                                                text: "×";
+                                                clicked => { root.remove_lora(i); }
+                                            }
+                                        }
+                                        ComboBox {
+                                            model: root.lora_labels;
+                                            // Row 0 is the "+ Add a LoRA…" sentinel; picking a real row
+                                            // appends it as a new LoRA row and snaps back to the sentinel
+                                            // so another (or the same) LoRA can be added next.
+                                            selected(value) => {
+                                                if (self.current-index >= 1) {
+                                                    root.add_lora(value);
+                                                    self.current-index = 0;
+                                                }
+                                            }
+                                        }
                                     }
-                                    Button { text: "Add…"; clicked => { root.form.lora = root.browse_lora_file(root.form.lora); } }
                                 }
                                 LabeledField {
-                                    label: "LoRA apply";
+                                    label: "LoRA apply (all)";
                                     ComboBox {
                                         // blank = sd-server default (auto). auto picks at_runtime on
                                         // quantized weights (~9x slower/step); immediately merges once.
@@ -905,6 +949,8 @@ export component AppWindow inherits Window {
 
                 // ─────────────── Page 2: MCP clients ───────────────
                 if root.current_tab == 2 : ScrollView {
+                    // Pin content to the visible width (see the Server tab).
+                    viewport-width: self.visible-width;
                     VerticalLayout {
                         padding: 24px;
                         spacing: 14px;
@@ -1013,25 +1059,49 @@ export component AppWindow inherits Window {
         }
 
         // ─── Footer status bar ──────────────────────────────────────
-        if root.status_text != "" : Rectangle {
-            height: status_text.preferred-height + 16px;
-            background: root.status_is_error
-                ? #c62828.transparentize(0.88)
-                : Palette.alternate-background;
+        // Always present: the action-result toast on the left, the live
+        // sd-server status pill on the right (moved here from the old top
+        // header). Clicking the pill force-refreshes the state-file probe.
+        Rectangle {
+            min-height: 40px;
+            background: Palette.alternate-background;
             // Top hairline divider.
             Rectangle {
                 y: 0;
                 height: 1px;
-                background: root.status_is_error ? #c62828 : Palette.border;
+                background: Palette.border;
             }
-            status_text := Text {
-                x: 16px;
-                width: parent.width - 32px;
-                text: root.status_text;
-                color: root.status_is_error ? #c62828 : Palette.foreground;
-                font-size: 12px;
-                wrap: word-wrap;
-                vertical-alignment: center;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 12px;
+                // Action-result toast (left). Wrapped in a stretch-1 layout so
+                // it always claims the leftover width even when empty —
+                // otherwise the status pill (a Rectangle, max-width infinite)
+                // would absorb the slack and stretch across the whole bar.
+                HorizontalLayout {
+                    horizontal-stretch: 1;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.status_text;
+                        color: root.status_is_error ? #c62828 : Palette.foreground;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                }
+                StatusPill {
+                    // A Rectangle defaults to a non-zero stretch, so without
+                    // this it would split the bar with the toast container and
+                    // balloon full-width. Pinned to 0 → it keeps its content
+                    // width and all slack flows to the toast on the left.
+                    horizontal-stretch: 0;
+                    running: root.server_running;
+                    text: root.server_status_text;
+                    clicked => { root.refresh_status(); }
+                }
             }
         }
     }
@@ -1222,6 +1292,251 @@ export component AppWindow inherits Window {
                             root.show_rename_dialog = false;
                             root.rename_preset(root.rename_old_id, root.rename_new_id);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── Top-right app-icon menu trigger ──────────────────────────────
+    // Replaces the old header: a clickable app icon floating in the
+    // top-right corner. Click → toggle the overflow menu below. Hidden
+    // while any modal is open so it never floats over a dialog backdrop.
+    if !root.show_new_kind_picker && !root.show_rename_dialog && !root.show_about_dialog : Rectangle {
+        x: root.width - self.width - 12px;
+        y: 8px;
+        width: 36px;
+        height: 32px;
+        border-radius: 6px;
+        background: menu_touch.has-hover || root.show_app_menu
+            ? Palette.alternate-background
+            : transparent;
+        Image {
+            source: root.window_icon;
+            width: 24px;
+            height: 24px;
+            image-fit: contain;
+        }
+        menu_touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.show_app_menu = !root.show_app_menu; }
+        }
+    }
+
+    // ─── Overflow menu popup ──────────────────────────────────────────
+    // A transparent full-window TouchArea catches outside clicks to
+    // dismiss; the menu card is anchored just under the icon.
+    if root.show_app_menu : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        TouchArea {
+            clicked => { root.show_app_menu = false; }
+        }
+        Rectangle {
+            x: root.width - self.width - 12px;
+            y: 44px;
+            width: 240px;
+            height: 93px;
+            background: Palette.background;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.border;
+            // Eat clicks inside the menu so the backdrop dismiss doesn't fire.
+            TouchArea { }
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                // Stop Server — greyed out and inert while nothing is running.
+                Rectangle {
+                    height: 34px;
+                    border-radius: 6px;
+                    background: (stop_touch.has-hover && root.server_running)
+                        ? Palette.alternate-background
+                        : transparent;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: "Stop Server";
+                            vertical-alignment: center;
+                            font-size: 13px;
+                            color: root.server_running
+                                ? Palette.foreground
+                                : Palette.foreground.transparentize(0.6);
+                        }
+                    }
+                    stop_touch := TouchArea {
+                        mouse-cursor: root.server_running ? pointer : default;
+                        clicked => {
+                            if (root.server_running) {
+                                root.show_app_menu = false;
+                                root.stop_server();
+                            }
+                        }
+                    }
+                }
+                // Separator between the action and About.
+                Rectangle {
+                    height: 9px;
+                    Rectangle {
+                        y: 4px;
+                        height: 1px;
+                        background: Palette.border;
+                    }
+                }
+                Rectangle {
+                    height: 34px;
+                    border-radius: 6px;
+                    background: about_touch.has-hover ? Palette.alternate-background : transparent;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: "About";
+                            vertical-alignment: center;
+                            font-size: 13px;
+                            color: Palette.foreground;
+                        }
+                    }
+                    about_touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.show_app_menu = false;
+                            root.show_about_dialog = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── About modal ──────────────────────────────────────────────────
+    // Project info + the live sd-server engine version (server_version,
+    // filled in by gui::spawn_version_probe; "detecting…" until it lands).
+    if root.show_about_dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000.transparentize(0.45);
+        TouchArea {
+            clicked => { root.show_about_dialog = false; }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 540px;
+            height: 350px;
+            background: Palette.background;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Palette.border;
+            // Eat clicks so the backdrop dismiss doesn't fire underneath.
+            TouchArea { }
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+                alignment: start;
+
+                HorizontalLayout {
+                    spacing: 14px;
+                    alignment: start;
+                    VerticalLayout {
+                        alignment: start;
+                        Image {
+                            source: root.window_icon;
+                            width: 48px;
+                            height: 48px;
+                            image-fit: contain;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "sd-config";
+                            font-size: 20px;
+                            font-weight: 700;
+                            color: Palette.foreground;
+                        }
+                        Text {
+                            text: "stable-diffusion.cpp configurator & MCP bridge";
+                            font-size: 12px;
+                            color: Palette.foreground.transparentize(0.4);
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: Palette.border;
+                }
+
+                VerticalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Configurator version";
+                            width: 150px;
+                            font-size: 13px;
+                            color: Palette.foreground.transparentize(0.35);
+                        }
+                        Text {
+                            text: root.app_version != "" ? root.app_version : "—";
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Engine version";
+                            width: 150px;
+                            font-size: 13px;
+                            color: Palette.foreground.transparentize(0.35);
+                        }
+                        Text {
+                            text: root.server_version != "" ? root.server_version : "detecting…";
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Upstream";
+                            width: 150px;
+                            font-size: 13px;
+                            color: Palette.foreground.transparentize(0.35);
+                        }
+                        Text {
+                            text: "github.com/leejet/stable-diffusion.cpp";
+                            font-size: 13px;
+                            color: Palette.foreground;
+                        }
+                    }
+                    Text {
+                        text: "Configure sd-server, manage per-model presets, and register the image-generation MCP server with your AI clients. Images are generated through sd-server's built-in web UI or the MCP tools.";
+                        font-size: 12px;
+                        color: Palette.foreground.transparentize(0.25);
+                        wrap: word-wrap;
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "Close";
+                        primary: true;
+                        clicked => { root.show_about_dialog = false; }
                     }
                 }
             }

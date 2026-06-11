@@ -30,7 +30,10 @@ pub struct Section {
 /// first `[Section]` header is recognized; writes never re-add it.
 fn read_existing(path: &Path) -> std::io::Result<String> {
     match fs::read_to_string(path) {
-        Ok(text) => Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)),
+        Ok(text) => Ok(text
+            .strip_prefix('\u{feff}')
+            .map(str::to_string)
+            .unwrap_or(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e),
     }
@@ -52,7 +55,10 @@ pub fn read_all(path: &Path) -> std::io::Result<Vec<Section>> {
                 if let Some(s) = cur.take() {
                     out.push(s);
                 }
-                cur = Some(Section { id: name.trim().to_string(), keys: BTreeMap::new() });
+                cur = Some(Section {
+                    id: name.trim().to_string(),
+                    keys: BTreeMap::new(),
+                });
                 continue;
             }
         }
@@ -85,7 +91,7 @@ fn strip_inline_comment(val: &str) -> Cow<'_, str> {
         if (c == ';' || c == '#') && prev_was_space {
             let rest = &val[i + c.len_utf8()..];
             // require at least one char of trailing context (matches PS `\s.*$`)
-            if rest.chars().next().map_or(false, char::is_whitespace) {
+            if rest.chars().next().is_some_and(char::is_whitespace) {
                 return Cow::Owned(val[..i].trim_end().to_string());
             }
         }
@@ -150,8 +156,7 @@ pub fn replace_key(path: &Path, section: &str, key: &str, value: &str) -> std::i
 
     let mut new_body = String::new();
     let mut replaced = false;
-    let mut lines_iter = section_body.split_inclusive('\n').peekable();
-    while let Some(line) = lines_iter.next() {
+    for line in section_body.split_inclusive('\n') {
         let trimmed = line.trim_start();
         if !replaced && line_starts_with_key(trimmed, key) {
             new_body.push_str(&new_line);
@@ -268,7 +273,11 @@ pub fn delete_section(path: &Path, section_name: &str) -> std::io::Result<()> {
     if next >= content.len() {
         let trimmed = out.trim_end_matches(['\r', '\n']).len();
         if trimmed > 0 && trimmed < out.len() {
-            let ending = if out[trimmed..].contains('\r') { "\r\n" } else { "\n" };
+            let ending = if out[trimmed..].contains('\r') {
+                "\r\n"
+            } else {
+                "\n"
+            };
             out.truncate(trimmed);
             out.push_str(ending);
         } else if trimmed == 0 {
@@ -418,7 +427,10 @@ mod tests {
         let t = TempIni::new("case", b"[server]\r\nPort = 1\r\n");
         replace_section(&t.0, "Server", "[Server]\r\nPort = 2\r\n").unwrap();
         let text = fs::read_to_string(&t.0).unwrap();
-        assert!(!text.contains("[server]"), "old lowercase header must be replaced:\n{text}");
+        assert!(
+            !text.contains("[server]"),
+            "old lowercase header must be replaced:\n{text}"
+        );
         assert_eq!(text.to_lowercase().matches("[server]").count(), 1);
         assert!(text.contains("Port = 2"));
     }
@@ -447,7 +459,10 @@ mod tests {
     #[test]
     fn rename_preserves_body() {
         let body = "k = v\r\n; comment stays\r\n";
-        let t = TempIni::new("rename", format!("[old]\r\n{body}[other]\r\nq = 1\r\n").as_bytes());
+        let t = TempIni::new(
+            "rename",
+            format!("[old]\r\n{body}[other]\r\nq = 1\r\n").as_bytes(),
+        );
         rename_section(&t.0, "old", "new").unwrap();
         let text = fs::read_to_string(&t.0).unwrap();
         assert_eq!(text, format!("[new]\r\n{body}[other]\r\nq = 1\r\n"));

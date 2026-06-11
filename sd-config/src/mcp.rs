@@ -102,10 +102,7 @@ fn check_installed(path: &Path, id: ClientId) -> Result<bool> {
     // re-serialize after inserting our own entry. Don't drop the feature flag.
     let v: Value = serde_json::from_str(&txt).context("parse JSON")?;
     let bucket_key = bucket_key(id);
-    let installed = v
-        .get(bucket_key)
-        .and_then(|b| b.get(SERVER_KEY))
-        .is_some();
+    let installed = v.get(bucket_key).and_then(|b| b.get(SERVER_KEY)).is_some();
     Ok(installed)
 }
 
@@ -244,4 +241,3 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
-
