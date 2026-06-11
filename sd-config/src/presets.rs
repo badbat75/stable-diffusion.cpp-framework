@@ -27,7 +27,20 @@ pub struct Preset {
     pub t5xxl: String,
     pub clip_l: String,
     pub clip_g: String,
-    pub lora_dir: String,
+    // Full LoRA file paths, each optionally `:<multiplier>`, comma-separated
+    // (see ConvertTo-LoraEntries in common-functions.ps1). Replaces the old
+    // lora-model-dir key: run-server.ps1 derives --lora-model-dir from the
+    // first entry's parent, so all entries must share one directory.
+    pub lora: String,
+    // Read-and-preserve passthrough for the PRE-RENAME `lora-model-dir` key
+    // (a directory). The GUI never exposes it — there is no widget — but it
+    // must survive a save: render_section rewrites the whole section, so a
+    // dropped value would silently strip --lora-model-dir from an old preset
+    // that has no `lora` entries yet. run-server.ps1 still honours it as a
+    // fallback when the preset yields no `lora` paths.
+    pub legacy_lora_dir: String,
+    // --lora-apply-mode: auto | immediately | at_runtime (empty = sd-server default).
+    pub lora_apply_mode: String,
     pub embd_dir: String,
     pub weight_type: String,
     pub offload_to_cpu: Option<bool>,
@@ -39,6 +52,8 @@ pub struct Preset {
     pub vae_tiling: Option<bool>,
     pub max_vram: Option<f64>,
     pub sampler: String,
+    // --flow-shift: flow-model sigma shift (SD3/Wan/Ideogram4…); None = auto.
+    pub flow_shift: Option<f64>,
     pub steps: Option<i32>,
     pub cfg_scale: Option<f64>,
     pub guidance: Option<f64>,
@@ -58,7 +73,9 @@ impl Default for Preset {
             t5xxl: String::new(),
             clip_l: String::new(),
             clip_g: String::new(),
-            lora_dir: String::new(),
+            lora: String::new(),
+            legacy_lora_dir: String::new(),
+            lora_apply_mode: String::new(),
             embd_dir: String::new(),
             weight_type: String::new(),
             offload_to_cpu: None,
@@ -70,6 +87,7 @@ impl Default for Preset {
             vae_tiling: None,
             max_vram: None,
             sampler: "euler".into(),
+            flow_shift: None,
             steps: Some(20),
             cfg_scale: Some(7.0),
             guidance: None,
@@ -110,7 +128,11 @@ impl Preset {
             t5xxl: get("t5xxl"),
             clip_l: get("clip_l"),
             clip_g: get("clip_g"),
-            lora_dir: get("lora-model-dir"),
+            lora: get("lora"),
+            // Pre-rename directory key — read so a save round-trips it (see
+            // the field comment + render_section); never edited in the GUI.
+            legacy_lora_dir: get("lora-model-dir"),
+            lora_apply_mode: get("lora-apply-mode"),
             embd_dir: get("embd-dir"),
             weight_type: get("type"),
             offload_to_cpu: getb("offload-to-cpu"),
@@ -122,6 +144,7 @@ impl Preset {
             vae_tiling: getb("vae-tiling"),
             max_vram: k.get("max-vram").and_then(|v| ini::parse_float(v)),
             sampler: get("sampler"),
+            flow_shift: k.get("flow-shift").and_then(|v| ini::parse_float(v)),
             steps: k.get("steps").and_then(|v| ini::parse_int(v)),
             cfg_scale: k.get("cfg-scale").and_then(|v| ini::parse_float(v)),
             guidance: k.get("guidance").and_then(|v| ini::parse_float(v)),
@@ -265,7 +288,22 @@ pub fn render_section(p: &Preset) -> String {
     emit_str(&mut out, "t5xxl", &p.t5xxl);
     emit_str(&mut out, "clip_l", &p.clip_l);
     emit_str(&mut out, "clip_g", &p.clip_g);
-    emit_str(&mut out, "lora-model-dir", &p.lora_dir);
+    // LoRAs: full file paths (like the model paths above), each optionally
+    // suffixed `:<multiplier>` (default 1.0), comma-separated. run-server.ps1
+    // derives --lora-model-dir from the first entry's parent (all entries must
+    // share one directory); mcp-server.ps1 injects them per request. There is
+    // deliberately no separate lora-model-dir key.
+    emit_str(&mut out, "lora", &p.lora);
+    // Pre-rename `lora-model-dir` (a directory) — preserved verbatim only when
+    // the loaded preset carried it, so editing an old preset in the GUI never
+    // strips its --lora-model-dir. emit_str skips empty values, so new presets
+    // (no legacy dir) stay byte-identical. run-server.ps1 falls back to it when
+    // the preset has no `lora` file paths.
+    emit_str(&mut out, "lora-model-dir", &p.legacy_lora_dir);
+    // auto | immediately | at_runtime (blank = sd-server default). `auto`
+    // picks at_runtime on quantized weights — correct but ~9x slower per step;
+    // `immediately` merges once into the weights (fast, slight precision loss).
+    emit_str(&mut out, "lora-apply-mode", &p.lora_apply_mode);
     emit_str(&mut out, "embd-dir", &p.embd_dir);
 
     out.push_str("\r\n; Memory / performance\r\n");
@@ -281,6 +319,8 @@ pub fn render_section(p: &Preset) -> String {
 
     out.push_str("\r\n; Default generation params (web UI can override per request)\r\n");
     emit_str(&mut out, "sampler", &p.sampler);
+    // Flow-model sigma shift (SD3/Wan/Ideogram4…); blank = sd-server auto.
+    emit_f64(&mut out, "flow-shift", p.flow_shift);
     emit_i32(&mut out, "steps", p.steps);
     emit_f64(&mut out, "cfg-scale", p.cfg_scale);
     emit_f64(&mut out, "guidance", p.guidance);

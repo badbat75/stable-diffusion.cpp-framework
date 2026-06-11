@@ -95,9 +95,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        let app_weak = app.as_weak();
         app.on_browse_models_dir(move |current| {
-            let _app = app_weak.upgrade();
             let start = if !current.is_empty() {
                 PathBuf::from(current.as_str())
             } else {
@@ -307,9 +305,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        let app_weak = app.as_weak();
         app.on_browse_dir(move |_field, current| {
-            let _app = app_weak.upgrade();
             let start = if !current.is_empty() {
                 PathBuf::from(current.as_str())
             } else {
@@ -318,6 +314,62 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             pick_dir(&start)
                 .map(|p| SharedString::from(p.to_string_lossy().into_owned()))
                 .unwrap_or(current)
+        });
+    }
+    {
+        app.on_browse_lora_file(move |current| {
+            let start = lora_browse_start(current.as_str());
+            match pick_lora_file(&start) {
+                Some(picked) => {
+                    let picked = picked.to_string_lossy().into_owned();
+                    let cur = current.trim();
+                    // sd-server resolves all of a preset's LoRAs against ONE
+                    // directory (run-server.ps1 derives it from the first
+                    // entry's parent), so a LoRA from a different folder won't
+                    // load at render time. Warn (cancellable) before appending
+                    // one whose parent differs from the LAST existing entry's.
+                    // (rfd MessageDialog is safe — the comctl6 manifest is
+                    // embedded by build.rs; see memory sd-config-manifest-comctl6.)
+                    if !cur.is_empty() {
+                        if let Some(last) = cur.rsplit(',').next() {
+                            let prev = lora_spec_dir(last.trim());
+                            let pick = PathBuf::from(&picked)
+                                .parent()
+                                .map(|p| p.to_path_buf());
+                            if let (Some(prev), Some(pick)) = (prev, pick) {
+                                if !prev.as_os_str().eq_ignore_ascii_case(pick.as_os_str()) {
+                                    let ok = rfd::MessageDialog::new()
+                                        .set_level(rfd::MessageLevel::Warning)
+                                        .set_title("LoRA is in a different folder")
+                                        .set_description(format!(
+                                            "All of a preset's LoRAs must live in one directory — sd-server \
+                                             resolves them against the first entry's folder ({}), so this file \
+                                             ({}) will not load at render time.\n\nAdd it anyway?",
+                                            prev.display(),
+                                            pick.display(),
+                                        ))
+                                        .set_buttons(rfd::MessageButtons::OkCancel)
+                                        .show();
+                                    if ok != rfd::MessageDialogResult::Ok {
+                                        return current;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Append to the existing comma-separated list (multiplier
+                    // defaults to 1.0 and is omitted; the user can add `:0.6`
+                    // by hand). Bare full paths only — no multiplier suffix —
+                    // so the drive colon never trips the parser.
+                    let joined = if cur.is_empty() {
+                        picked
+                    } else {
+                        format!("{cur}, {picked}")
+                    };
+                    SharedString::from(joined)
+                }
+                None => current,
+            }
         });
     }
 
@@ -440,6 +492,52 @@ fn pick_dir(start: &std::path::Path) -> Option<PathBuf> {
         .set_title("Pick a folder")
         .set_directory(start)
         .pick_folder()
+}
+
+fn pick_lora_file(start: &std::path::Path) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Pick a LoRA file")
+        .add_filter("weights", &["safetensors", "gguf"])
+        .set_directory(start)
+        .pick_file()
+}
+
+/// Strip an optional trailing `:<mult>` off one comma-separated `lora` entry,
+/// returning the bare file path. Only strips when the suffix parses as a
+/// number, so the drive colon in `E:\…` is left intact (mirrors
+/// ConvertTo-LoraEntries). Single source of truth for both the browse-start
+/// directory and the same-directory warning, so the `:<mult>` parser isn't
+/// re-implemented a third time.
+fn lora_spec_path(spec: &str) -> &str {
+    let spec = spec.trim();
+    match spec.rfind(':') {
+        Some(i) if i > 1 && spec[i + 1..].trim().parse::<f64>().is_ok() => spec[..i].trim(),
+        _ => spec,
+    }
+}
+
+/// Parent directory of a single `lora` entry (after stripping `:<mult>`), or
+/// None when the entry is empty / has no parent component.
+fn lora_spec_dir(spec: &str) -> Option<PathBuf> {
+    let path = lora_spec_path(spec);
+    if path.is_empty() {
+        return None;
+    }
+    PathBuf::from(path).parent().map(|p| p.to_path_buf())
+}
+
+/// Start directory for the LoRA file picker: the parent of the last entry
+/// already in the `lora` field (so picking a sibling LoRA — they must all
+/// share one directory — is one click), else the default ModelsDir.
+fn lora_browse_start(current: &str) -> PathBuf {
+    if let Some(last) = current.rsplit(',').next() {
+        if let Some(parent) = lora_spec_dir(last) {
+            if parent.is_dir() {
+                return parent;
+            }
+        }
+    }
+    PathBuf::from(server_cfg::default_models_dir())
 }
 
 /// Push the scanned model list (Category::Model under ModelsDir) into
@@ -875,7 +973,9 @@ fn preset_to_form(p: &presets::Preset) -> PresetForm {
         t5xxl: p.t5xxl.clone().into(),
         clip_l: p.clip_l.clone().into(),
         clip_g: p.clip_g.clone().into(),
-        lora_dir: p.lora_dir.clone().into(),
+        lora: p.lora.clone().into(),
+        legacy_lora_dir: p.legacy_lora_dir.clone().into(),
+        lora_apply_mode: p.lora_apply_mode.clone().into(),
         embd_dir: p.embd_dir.clone().into(),
         weight_type: p.weight_type.clone().into(),
         offload_to_cpu: p.offload_to_cpu.unwrap_or(false),
@@ -887,6 +987,7 @@ fn preset_to_form(p: &presets::Preset) -> PresetForm {
         vae_tiling: p.vae_tiling.unwrap_or(false),
         max_vram: p.max_vram.map(|v| v.to_string()).unwrap_or_default().into(),
         sampler: if p.sampler.is_empty() { "euler".into() } else { p.sampler.clone().into() },
+        flow_shift: p.flow_shift.map(|v| v.to_string()).unwrap_or_default().into(),
         steps: p.steps.unwrap_or(20),
         cfg_scale: p.cfg_scale.map(|v| v.to_string()).unwrap_or_else(|| "7".into()).into(),
         guidance: p.guidance.map(|v| v.to_string()).unwrap_or_default().into(),
@@ -906,7 +1007,9 @@ fn form_to_preset(f: &PresetForm) -> presets::Preset {
         t5xxl: f.t5xxl.to_string(),
         clip_l: f.clip_l.to_string(),
         clip_g: f.clip_g.to_string(),
-        lora_dir: f.lora_dir.to_string(),
+        lora: f.lora.to_string(),
+        legacy_lora_dir: f.legacy_lora_dir.to_string(),
+        lora_apply_mode: f.lora_apply_mode.to_string(),
         embd_dir: f.embd_dir.to_string(),
         weight_type: f.weight_type.to_string(),
         offload_to_cpu: Some(f.offload_to_cpu),
@@ -918,6 +1021,7 @@ fn form_to_preset(f: &PresetForm) -> presets::Preset {
         vae_tiling: Some(f.vae_tiling),
         max_vram: parse_float_opt(f.max_vram.as_str()),
         sampler: f.sampler.to_string(),
+        flow_shift: parse_float_opt(f.flow_shift.as_str()),
         steps: Some(f.steps).filter(|v| *v > 0),
         cfg_scale: parse_float_opt(f.cfg_scale.as_str()),
         guidance: parse_float_opt(f.guidance.as_str()),

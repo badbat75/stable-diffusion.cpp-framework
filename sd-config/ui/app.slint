@@ -46,7 +46,11 @@ export struct PresetForm {
     t5xxl: string,
     clip_l: string,
     clip_g: string,
-    lora_dir: string,
+    lora: string,
+    // Pre-rename lora-model-dir passthrough — round-tripped only, NO widget;
+    // see Preset::legacy_lora_dir in presets.rs.
+    legacy_lora_dir: string,
+    lora_apply_mode: string,
     embd_dir: string,
     weight_type: string,
     offload_to_cpu: bool,
@@ -58,6 +62,7 @@ export struct PresetForm {
     vae_tiling: bool,
     max_vram: string,
     sampler: string,
+    flow_shift: string,
     steps: int,
     cfg_scale: string,
     guidance: string,
@@ -334,6 +339,9 @@ export component AppWindow inherits Window {
     callback pick_new_clone();
     callback rename_preset(string, string);
     callback browse_dir(string, string) -> string;
+    // Picks a single LoRA file and appends it (as a full path) to the current
+    // comma-separated `lora` value; returns the new value (or unchanged on cancel).
+    callback browse_lora_file(string) -> string;
 
     callback mcp_install(string);
     callback mcp_uninstall(string);
@@ -754,9 +762,23 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 LabeledField {
-                                    label: "LoRA dir";
-                                    LineEdit { text: root.form.lora_dir; edited(t) => { root.form.lora_dir = t; } }
-                                    Button { text: "…"; clicked => { root.form.lora_dir = root.browse_dir("lora_dir", root.form.lora_dir); } }
+                                    label: "LoRA files";
+                                    LineEdit {
+                                        text: root.form.lora;
+                                        placeholder-text: "full path(s), optional :multiplier, comma-separated";
+                                        edited(t) => { root.form.lora = t; }
+                                    }
+                                    Button { text: "Add…"; clicked => { root.form.lora = root.browse_lora_file(root.form.lora); } }
+                                }
+                                LabeledField {
+                                    label: "LoRA apply";
+                                    ComboBox {
+                                        // blank = sd-server default (auto). auto picks at_runtime on
+                                        // quantized weights (~9x slower/step); immediately merges once.
+                                        model: ["", "auto", "immediately", "at_runtime"];
+                                        current-value: root.form.lora_apply_mode;
+                                        selected(value) => { root.form.lora_apply_mode = value; }
+                                    }
                                 }
                                 LabeledField {
                                     label: "Embed dir";
@@ -806,6 +828,14 @@ export component AppWindow inherits Window {
                                         model: ["euler_a","euler","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","lcm","ipndm","ipndm_v","ddim_trailing","tcd"];
                                         current-value: root.form.sampler == "" ? "euler" : root.form.sampler;
                                         selected(value) => { root.form.sampler = value; }
+                                    }
+                                }
+                                LabeledField {
+                                    label: "Flow shift";
+                                    LineEdit {
+                                        text: root.form.flow_shift;
+                                        placeholder-text: "SD3/Wan/Ideogram4 sigma shift; blank = auto (Ideogram4 ref ≈ 5)";
+                                        edited(t) => { root.form.flow_shift = t; }
                                     }
                                 }
                                 LabeledField {

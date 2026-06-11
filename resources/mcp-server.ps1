@@ -12,7 +12,10 @@
 # reads that file to learn the live pid/host/port/preset.
 #
 # Tools exposed:
-#   generate_image     — txt2img / img2img via /sdcpp/v1/img_gen
+#   generate_image     — txt2img / img2img via /sdcpp/v1/img_gen; async
+#                        (fire-and-forget) by default, wait=true to block
+#   check_image_job    — poll an async job by id; deliver the image when done
+#   cancel_image_job   — cancel a queued/running async job by id
 #   encode_file_base64 — read a local file, return base64 (debug aid)
 #   get_model_info     — curated /sdcpp/v1/capabilities snapshot
 #   server_status      — is sd-server alive and ready to serve?
@@ -109,7 +112,12 @@ function Invoke-SdJson {
         # success" — the body is the only diagnostic sd-server gives.
         $detail = $_.ErrorDetails.Message
         if ($detail) {
-            throw "sd-server returned an error for $Method $Path — $($_.Exception.Message) Body: $detail"
+            # Throw a real [Exception] (not a string) and stash the HTTP status
+            # in .Data — a string throw erases both the exception type and the
+            # status code, and check_image_job needs to key 404 off it.
+            $ex = [System.Exception]::new("sd-server returned an error for $Method $Path — $($_.Exception.Message) Body: $detail")
+            $ex.Data['StatusCode'] = [int]$_.Exception.Response.StatusCode
+            throw $ex
         }
         throw
     }
@@ -169,8 +177,57 @@ function Test-WantsStructuredJsonPrompt {
     return [bool]($name -and $name -match 'ideogram')
 }
 
+# sd-server's APIs intentionally refuse <lora:...> prompt tags; LoRAs must
+# arrive as the structured `lora` array on each img_gen request, and there is
+# no server-side per-model default. Per-preset LoRAs are therefore an INI
+# contract owned by this bridge: the active preset's `lora` key holds FULL
+# file paths with optional :<multiplier> (see ConvertTo-LoraEntries in
+# common-functions.ps1). run-server.ps1 derives --lora-model-dir from the
+# first entry's parent directory, so what sd-server's resolver wants here is
+# the path RELATIVE to that dir — i.e. the bare filename (which is also why
+# all of a preset's LoRAs must share one directory). The built-in web UI has
+# its own LoRA selector and ignores this key.
+function Get-ActivePresetLoraList {
+    # -State lets a caller pass an already-read sd-server.state so we don't
+    # re-read it (Invoke-GenerateImage reads it once for both this and the
+    # sidecar). Omitted → read it ourselves, so list_presets etc. stay
+    # self-sufficient.
+    param($State)
+    if ($PSBoundParameters.ContainsKey('State')) { $state = $State } else { $state = Read-SdServerState }
+    $presetId = if ($state) { [string]$state.preset } else { $null }
+    if (-not $presetId) { return @() }
+
+    $presetsPath = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config\presets.ini"
+    $preset = @(Get-Presets -Path $presetsPath) | Where-Object { $_.Id -eq $presetId } | Select-Object -First 1
+    if (-not $preset -or -not $preset.Keys['lora']) { return @() }
+
+    # sd-server resolves every injected LoRA against ONE --lora-model-dir (the
+    # first entry's parent, picked by run-server.ps1), so a second LoRA from a
+    # different folder fails cryptically at render. Warn once if the dirs differ.
+    $parsed   = @(ConvertTo-LoraEntries -Value ([string]$preset.Keys['lora']))
+    $firstDir = if ($parsed.Count -gt 0) { Split-Path -Parent $parsed[0].Path } else { '' }
+    $multiDir = $false
+    $entries = @()
+    foreach ($e in $parsed) {
+        $dir = Split-Path -Parent $e.Path
+        if ($dir -and $firstDir -and ($dir -ine $firstDir)) { $multiDir = $true }
+        $entries += @{ path = [System.IO.Path]::GetFileName($e.Path); multiplier = $e.Multiplier }
+    }
+    if ($multiDir) {
+        Write-Log WARN ("preset '{0}' has LoRA entries in more than one directory; sd-server resolves all of them against '{1}' (the first entry's parent), so LoRAs from other folders will not load." -f $presetId, $firstDir)
+    }
+    # No `,$entries`: the caller collects with @(...), and a comma-wrapper
+    # would nest ([[{...}]] in the JSON body — sd-server 400s on it).
+    return $entries
+}
+
 function Invoke-GenerateImage {
     param([hashtable]$Arguments, $ProgressToken = $null)
+
+    # Read sd-server.state ONCE: both the LoRA injection (Get-ActivePresetLoraList)
+    # and the params sidecar's `preset` field need it, and re-reading risks them
+    # disagreeing if a switch_preset lands mid-call.
+    $serverState = Read-SdServerState
 
     # Prompt comes in one of two shapes: plain `prompt` (string) or
     # `prompt_json` (object) for JSON-caption-native models. The object
@@ -216,6 +273,7 @@ function Invoke-GenerateImage {
     if ($Arguments.ContainsKey('steps'))       { $sampleParams.sample_steps  = [int]$Arguments['steps'] }
     if ($Arguments.ContainsKey('sampler'))     { $sampleParams.sample_method = [string]$Arguments['sampler'] }
     if ($Arguments.ContainsKey('scheduler'))   { $sampleParams.scheduler     = [string]$Arguments['scheduler'] }
+    if ($Arguments.ContainsKey('flow_shift'))  { $sampleParams.flow_shift    = [double]$Arguments['flow_shift'] }
     if ($Arguments.ContainsKey('cfg_scale'))   { $guidance.txt_cfg            = [double]$Arguments['cfg_scale'] }
     if ($Arguments.ContainsKey('guidance'))    { $guidance.distilled_guidance = [double]$Arguments['guidance'] }
     if ($guidance.Count -gt 0)                 { $sampleParams.guidance      = $guidance }
@@ -254,6 +312,34 @@ function Invoke-GenerateImage {
     if ($Arguments.ContainsKey('strength'))              { $body.strength              = [double]$Arguments['strength'] }
     if ($Arguments.ContainsKey('auto_resize_ref_image')) { $body.auto_resize_ref_image = [bool]$Arguments['auto_resize_ref_image'] }
 
+    # Per-preset LoRAs from the INI `lora` key (see Get-ActivePresetLoraList).
+    # `lora_multiplier` overrides the INI multiplier for this request only
+    # (applies to every entry; 0 disables the preset LoRAs entirely). The
+    # INI value (e.g. :0.6) stays the default when the arg is omitted.
+    $loraList = @(Get-ActivePresetLoraList -State $serverState)
+    if ($Arguments.ContainsKey('lora_multiplier')) {
+        $loraMult = [double]$Arguments['lora_multiplier']
+        if ($loraList.Count -eq 0) {
+            Write-Log WARN 'lora_multiplier supplied but the active preset has no lora key - ignored'
+        } elseif ($loraMult -eq 0) {
+            Write-Log INFO 'lora_multiplier=0: preset LoRAs disabled for this request'
+            $loraList = @()
+        } else {
+            # Rebuild fresh hashtables rather than mutating the ones returned by
+            # Get-ActivePresetLoraList in place — if that ever gets memoised, an
+            # in-place edit here would poison the cached list for later requests.
+            $loraList = @(foreach ($l in $loraList) { @{ path = $l.path; multiplier = $loraMult } })
+        }
+    }
+    if ($loraList.Count -gt 0) {
+        $body.lora = $loraList
+        # Invariant culture: -f would render 0.6 as "0,6" under it-IT.
+        Write-Log INFO ("preset LoRAs injected: {0}" -f (@(
+            foreach ($l in $loraList) {
+                '{0}:{1}' -f $l.path, $l.multiplier.ToString([Globalization.CultureInfo]::InvariantCulture)
+            }) -join ', '))
+    }
+
     $promptPreview = $body.prompt.Substring(0, [Math]::Min(60, $body.prompt.Length))
     $hasInit       = if ($body.ContainsKey('init_image')) { 'yes' } else { 'no' }
     Write-Log INFO ("submit img_gen: '{0}...' {1}x{2} batch={3} fmt={4} init_image={5} ref_images={6}" -f
@@ -266,8 +352,92 @@ function Invoke-GenerateImage {
     }
     Write-Log INFO "job submitted: $jobId"
 
-    # Emit an initial progress event so the client gets immediate feedback
-    # even before sd-server transitions out of "queued".
+    # Build the job metadata once, up front, so it survives the async gap:
+    # check_image_job (which only ever receives a job_id) reads it back to
+    # honour save_path / return_inline and to write the params sidecar.
+    # `snapshot` is the replayable request record — everything but the
+    # per-image seeds and saved file paths, which only exist once the render
+    # finishes (Complete-ImageJob appends those).
+    $wait = $false
+    if ($Arguments.ContainsKey('wait')) { $wait = [bool]$Arguments['wait'] }
+
+    $savePath = if ($Arguments.ContainsKey('save_path')) { [string]$Arguments['save_path'] } else { '' }
+    $returnInline = if ($Arguments.ContainsKey('return_inline')) {
+        [bool]$Arguments['return_inline']
+    } else {
+        [string]::IsNullOrWhiteSpace($savePath)
+    }
+
+    $snapshot = [ordered]@{ timestamp = (Get-Date).ToString('o') }
+    # Reuse the state read once at the top of this function (see $serverState).
+    if ($serverState -and $serverState.preset) { $snapshot.preset = [string]$serverState.preset }
+    $snapshot.prompt = $body.prompt
+    if ($body.ContainsKey('negative_prompt')) { $snapshot.negative_prompt = $body.negative_prompt }
+    $snapshot.width       = $body.width
+    $snapshot.height      = $body.height
+    $snapshot.batch_count = $body.batch_count
+    if ($body.ContainsKey('seed')) { $snapshot.seed = $body.seed }
+    if ($body.sample_params) {
+        $sp = $body.sample_params
+        if ($sp.sample_method) { $snapshot.sampler   = $sp.sample_method }
+        if ($sp.sample_steps)  { $snapshot.steps     = $sp.sample_steps }
+        if ($sp.scheduler)     { $snapshot.scheduler = $sp.scheduler }
+        if ($sp.flow_shift)    { $snapshot.flow_shift = $sp.flow_shift }
+        if ($sp.guidance) {
+            if ($null -ne $sp.guidance.txt_cfg)            { $snapshot.cfg_scale = $sp.guidance.txt_cfg }
+            if ($null -ne $sp.guidance.distilled_guidance) { $snapshot.guidance  = $sp.guidance.distilled_guidance }
+        }
+    }
+    $snapshot.output_format = $body.output_format
+    if ($body.ContainsKey('output_compression')) { $snapshot.output_compression = $body.output_compression }
+    if ($Arguments.ContainsKey('init_image')) {
+        $orig = [string]$Arguments['init_image']
+        $snapshot.init_image = if (Test-Path -LiteralPath $orig -PathType Leaf) {
+            (Resolve-Path -LiteralPath $orig).Path
+        } else { '<inline base64 / data URL>' }
+    }
+    if ($Arguments.ContainsKey('ref_images') -and $Arguments['ref_images']) {
+        $snapshot.ref_images = @(
+            foreach ($r in @($Arguments['ref_images'])) {
+                $rs = [string]$r
+                if (Test-Path -LiteralPath $rs -PathType Leaf) {
+                    (Resolve-Path -LiteralPath $rs).Path
+                } else { '<inline base64 / data URL>' }
+            }
+        )
+    }
+    if ($body.ContainsKey('strength'))              { $snapshot.strength              = $body.strength }
+    if ($body.ContainsKey('auto_resize_ref_image')) { $snapshot.auto_resize_ref_image = $body.auto_resize_ref_image }
+    if ($body.ContainsKey('lora')) {
+        # Invariant culture so the sidecar stays replayable ("0.6", not the
+        # it-IT "0,6" that -f would produce).
+        $snapshot.lora = @(foreach ($l in $body.lora) {
+            '{0}:{1}' -f $l.path, $l.multiplier.ToString([Globalization.CultureInfo]::InvariantCulture)
+        })
+    }
+    $meta = [ordered]@{
+        started_at    = (Get-Date).ToString('o')
+        save_path     = $savePath
+        return_inline = $returnInline
+        snapshot      = $snapshot
+    }
+
+    # Fire-and-forget (the default): stash the meta and hand back the job id
+    # immediately. The caller polls check_image_job for progress + the image.
+    if (-not $wait) {
+        Save-JobMeta -JobId $jobId -Meta $meta
+        $payload = [ordered]@{
+            job_id  = $jobId
+            status  = 'submitted'
+            message = 'Image generation started (fire-and-forget). Poll check_image_job with this job_id for progress and the finished image; cancel with cancel_image_job.'
+        }
+        Write-Log INFO "generate_image async: returned job_id $jobId"
+        return @{ content = @(@{ type = 'text'; text = ($payload | ConvertTo-Json -Depth 5) }) }
+    }
+
+    # wait=true: block until the render is done, streaming progress. Emit an
+    # initial progress event so the client gets immediate feedback even
+    # before sd-server transitions out of "queued".
     if ($null -ne $ProgressToken) {
         Send-RpcNotification 'notifications/progress' @{
             progressToken = $ProgressToken
@@ -345,25 +515,40 @@ function Invoke-GenerateImage {
         throw "job $jobId $($job.status) — $errMsg"
     }
 
-    $images = @($job.result.images)
-    if ($images.Count -eq 0) { throw "job $jobId completed but returned no images" }
+    # Round-trip meta through JSON so Complete-ImageJob always sees the same
+    # PSCustomObject shape it gets from check_image_job's on-disk meta file.
+    return Complete-ImageJob -Job $job -Meta ($meta | ConvertTo-Json -Depth 12 | ConvertFrom-Json)
+}
 
-    $mime = switch ([string]$job.result.output_format) {
+# ── Result delivery (shared) ─────────────────────────────────────────
+# Turns a COMPLETED sd-server job into the MCP tool result: optional disk
+# save (+ params sidecar), optional inline base64, summary text. Used by
+# generate_image's wait-mode and by check_image_job. $Meta is the record
+# stashed at submit time (started_at / save_path / return_inline / snapshot);
+# $null is tolerated (job submitted outside this server, no meta on disk) and
+# degrades to "inline only".
+function Complete-ImageJob {
+    param($Job, $Meta)
+
+    $images = @($Job.result.images)
+    if ($images.Count -eq 0) { throw "job completed but returned no images" }
+
+    $mime = switch ([string]$Job.result.output_format) {
         'png'  { 'image/png' }
         'jpeg' { 'image/jpeg' }
         'webp' { 'image/webp' }
         default { 'application/octet-stream' }
     }
 
-    # save_path: optional disk dump. When set, default is to NOT also stream
-    # the image inline (return_inline opts back in). When unset, default
-    # remains "inline only" so existing callers are unaffected.
-    $savePath = if ($Arguments.ContainsKey('save_path')) { [string]$Arguments['save_path'] } else { '' }
-    $returnInline = if ($Arguments.ContainsKey('return_inline')) {
-        [bool]$Arguments['return_inline']
+    $savePath = if ($Meta -and $Meta.save_path) { [string]$Meta.save_path } else { '' }
+    $returnInline = if ($Meta -and ($null -ne $Meta.return_inline)) {
+        [bool]$Meta.return_inline
     } else {
         [string]::IsNullOrWhiteSpace($savePath)
     }
+    $started = if ($Meta -and $Meta.started_at) {
+        try { (ConvertTo-StartedDto $Meta.started_at).LocalDateTime } catch { Get-Date }
+    } else { Get-Date }
 
     $savedPaths   = @()
     $savedSidecar = $null
@@ -398,71 +583,26 @@ function Invoke-GenerateImage {
         }
 
         # ── Params sidecar ───────────────────────────────────────────
-        # One JSON per request, named after $save_path's stem (no _NNN
-        # suffix even for a batch — describes the request, not a frame).
-        # Holds the flat MCP args so a caller can replay the exact call;
-        # init_image / ref_images are recorded as their *original* paths
-        # rather than the base64 payload we forwarded to sd-server, both
-        # to keep the file small and because the source files outlive
-        # the encoded copy. Seeds reported per-image by sd-server (when
-        # present) are captured in `seeds_used` so a batch with seed=-1
-        # is still reproducible one image at a time.
-        $sidecarPath = [System.IO.Path]::ChangeExtension($resolved, '.json')
-
-        $snapshot = [ordered]@{
-            timestamp = (Get-Date).ToString('o')
+        # The replayable request record stashed at submit time, now finished
+        # with the per-image seeds sd-server reported and the saved file
+        # paths. One JSON per request, named after $save_path's stem (no _NNN
+        # suffix even for a batch — it describes the request, not a frame).
+        $resolvedSidecar = [System.IO.Path]::ChangeExtension($resolved, '.json')
+        $snapshot = [ordered]@{}
+        if ($Meta -and $Meta.snapshot) {
+            foreach ($prop in $Meta.snapshot.PSObject.Properties) { $snapshot[$prop.Name] = $prop.Value }
         }
-        $stateForSidecar = Read-SdServerState
-        if ($stateForSidecar -and $stateForSidecar.preset) {
-            $snapshot.preset = [string]$stateForSidecar.preset
-        }
-        $snapshot.prompt = $body.prompt
-        if ($body.ContainsKey('negative_prompt')) { $snapshot.negative_prompt = $body.negative_prompt }
-        $snapshot.width       = $body.width
-        $snapshot.height      = $body.height
-        $snapshot.batch_count = $body.batch_count
-        if ($body.ContainsKey('seed')) { $snapshot.seed = $body.seed }
-        if ($body.sample_params) {
-            $sp = $body.sample_params
-            if ($sp.sample_method) { $snapshot.sampler   = $sp.sample_method }
-            if ($sp.sample_steps)  { $snapshot.steps     = $sp.sample_steps }
-            if ($sp.scheduler)     { $snapshot.scheduler = $sp.scheduler }
-            if ($sp.guidance) {
-                if ($null -ne $sp.guidance.txt_cfg)            { $snapshot.cfg_scale = $sp.guidance.txt_cfg }
-                if ($null -ne $sp.guidance.distilled_guidance) { $snapshot.guidance  = $sp.guidance.distilled_guidance }
-            }
-        }
-        $snapshot.output_format = $body.output_format
-        if ($body.ContainsKey('output_compression')) { $snapshot.output_compression = $body.output_compression }
-        if ($Arguments.ContainsKey('init_image')) {
-            $orig = [string]$Arguments['init_image']
-            $snapshot.init_image = if (Test-Path -LiteralPath $orig -PathType Leaf) {
-                (Resolve-Path -LiteralPath $orig).Path
-            } else { '<inline base64 / data URL>' }
-        }
-        if ($Arguments.ContainsKey('ref_images') -and $Arguments['ref_images']) {
-            $snapshot.ref_images = @(
-                foreach ($r in @($Arguments['ref_images'])) {
-                    $rs = [string]$r
-                    if (Test-Path -LiteralPath $rs -PathType Leaf) {
-                        (Resolve-Path -LiteralPath $rs).Path
-                    } else { '<inline base64 / data URL>' }
-                }
-            )
-        }
-        if ($body.ContainsKey('strength'))              { $snapshot.strength              = $body.strength }
-        if ($body.ContainsKey('auto_resize_ref_image')) { $snapshot.auto_resize_ref_image = $body.auto_resize_ref_image }
         $seedsUsed = @(foreach ($img in $images) { if ($null -ne $img.seed) { $img.seed } })
         if ($seedsUsed.Count -gt 0) { $snapshot.seeds_used = $seedsUsed }
         $snapshot.saved_images = $savedPaths
 
         try {
             $sidecarJson = $snapshot | ConvertTo-Json -Depth 6
-            [System.IO.File]::WriteAllText($sidecarPath, $sidecarJson, [System.Text.UTF8Encoding]::new($false))
-            $savedSidecar = $sidecarPath
-            Write-Log INFO ("saved params sidecar: {0}" -f $sidecarPath)
+            [System.IO.File]::WriteAllText($resolvedSidecar, $sidecarJson, [System.Text.UTF8Encoding]::new($false))
+            $savedSidecar = $resolvedSidecar
+            Write-Log INFO ("saved params sidecar: {0}" -f $resolvedSidecar)
         } catch {
-            Write-Log WARN ("failed to write params sidecar {0}: {1}" -f $sidecarPath, $_.Exception.Message)
+            Write-Log WARN ("failed to write params sidecar {0}: {1}" -f $resolvedSidecar, $_.Exception.Message)
         }
     }
 
@@ -474,10 +614,9 @@ function Invoke-GenerateImage {
     $imageContents = @()
     if ($returnInline) {
         foreach ($img in $images) {
-            $b64 = [string]$img.b64_json
             $imageContents += @{
                 type        = 'image'
-                data        = $b64
+                data        = [string]$img.b64_json
                 mimeType    = $mime
                 annotations = @{ audience = @('user'); priority = 0.9 }
             }
@@ -495,10 +634,212 @@ function Invoke-GenerateImage {
     if (-not $returnInline) {
         $summary += " (Inline image omitted; pass return_inline=true to also embed.)"
     }
-    Write-Log INFO ("job {0} completed in {1}s — {2} image(s), inline={3}, saved={4}, sidecar={5}" -f
-        $jobId, $elapsed, $images.Count, $returnInline, $savedPaths.Count, [bool]$savedSidecar)
+    Write-Log INFO ("job completed in {0}s — {1} image(s), inline={2}, saved={3}, sidecar={4}" -f
+        $elapsed, $images.Count, $returnInline, $savedPaths.Count, [bool]$savedSidecar)
 
     return @{ content = @(@{ type = 'text'; text = $summary }) + $imageContents }
+}
+
+# ── Async job metadata persistence ───────────────────────────────────
+# generate_image is fire-and-forget by default: it submits to sd-server's
+# async /sdcpp/v1/img_gen and returns the job id immediately; check_image_job
+# fetches the result later. To carry save_path / sidecar params /
+# return_inline / start time across that gap (the status call only receives a
+# job id) we stash a small JSON per job under run\jobs\. check_image_job /
+# cancel_image_job read + delete it on terminal status; a missing file just
+# means "deliver inline only" (e.g. a job started by the web UI).
+$script:JobsDir = Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\run\jobs"
+
+# Startup GC: jobs that were never polled (the client crashed or wandered off)
+# would otherwise pile up forever and clutter the no-arg check_image_job list.
+# Drop meta files older than 7 days — well past any realistic render time.
+try {
+    if (Test-Path -LiteralPath $script:JobsDir) {
+        $cutoff = (Get-Date).AddDays(-7)
+        Get-ChildItem -LiteralPath $script:JobsDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+
+# started_at is written as an ISO-8601 'o' string, but ConvertFrom-Json
+# auto-parses date-like strings into [datetime] when reading the meta back.
+# Re-parsing a [datetime] through [datetimeoffset]::Parse (a string API) would
+# round-trip it through the it-IT culture and mangle the value, so normalise
+# both shapes here.
+function ConvertTo-StartedDto {
+    param($Value)
+    if ($Value -is [datetimeoffset]) { return $Value }
+    if ($Value -is [datetime])       { return [datetimeoffset]$Value }
+    return [datetimeoffset]::Parse([string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind)
+}
+
+function Get-JobMetaPath {
+    param([string]$JobId)
+    # Server ids are uuid/hex; refuse anything that could escape the jobs dir
+    # before using it as a filename.
+    if ([string]::IsNullOrWhiteSpace($JobId) -or $JobId -notmatch '^[A-Za-z0-9_.-]+$') { return $null }
+    return (Join-Path $script:JobsDir ("{0}.json" -f $JobId))
+}
+
+function Save-JobMeta {
+    param([string]$JobId, $Meta)
+    $path = Get-JobMetaPath $JobId
+    if (-not $path) { return }
+    try {
+        New-Item -ItemType Directory -Path $script:JobsDir -Force | Out-Null
+        $json = $Meta | ConvertTo-Json -Depth 12
+        [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        Write-Log WARN ("failed to persist job meta for {0}: {1}" -f $JobId, $_.Exception.Message)
+    }
+}
+
+function Read-JobMeta {
+    param([string]$JobId)
+    $path = Get-JobMetaPath $JobId
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch {
+        Write-Log WARN ("failed to read job meta for {0}: {1}" -f $JobId, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Remove-JobMeta {
+    param([string]$JobId)
+    $path = Get-JobMetaPath $JobId
+    if ($path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+}
+
+# ── Tool: check_image_job ────────────────────────────────────────────
+# Poll one async generate_image job by id (single GET, no blocking). While
+# pending → status + queue_position + elapsed. On completion → delivers the
+# image (inline / save_path) via Complete-ImageJob, honouring the save_path /
+# return_inline stashed at submit, then forgets the job. On failure/cancel →
+# isError with the server's reason. Called with no job_id → lists the jobs
+# this server is locally tracking.
+function Invoke-CheckImageJob {
+    param([hashtable]$Arguments)
+
+    $jobId = if ($Arguments -and $Arguments.ContainsKey('job_id')) { [string]$Arguments['job_id'] } else { '' }
+    if ([string]::IsNullOrWhiteSpace($jobId)) { return (Get-PendingJobList) }
+
+    # A 404 means sd-server RESPONDED but has forgotten this job (it was
+    # restarted, or the id is bogus). Without this the bare throw would skip
+    # Remove-JobMeta and leave a zombie meta file polluting the pending list
+    # forever, with no escape hatch — so on 404 only, drop the meta and report
+    # cleanly. Any OTHER failure (connection refused, timeout) is NOT proof the
+    # job is gone, so we rethrow and keep the meta for a later retry.
+    try {
+        $job = Invoke-SdJson -Method GET -Path "/sdcpp/v1/jobs/$jobId" -TimeoutSec 10
+    } catch {
+        # Invoke-SdJson re-throws HTTP errors that carry a body as a plain
+        # [Exception] with the status in .Data (the usual case — sd-server's
+        # 404 has a JSON body); only a body-less error surfaces as the original
+        # HttpResponseException. Handle both shapes.
+        $httpStatus = $null
+        if ($_.Exception -is [Microsoft.PowerShell.Commands.HttpResponseException]) {
+            $httpStatus = [int]$_.Exception.Response.StatusCode
+        } elseif ($_.Exception.Data -and $_.Exception.Data.Contains('StatusCode')) {
+            $httpStatus = [int]$_.Exception.Data['StatusCode']
+        }
+        if ($httpStatus -eq 404) {
+            Remove-JobMeta $jobId
+            Write-Log WARN ("check_image_job: {0} unknown to sd-server (404) — dropping local tracking" -f $jobId)
+            return @{ content = @(@{ type = 'text'; text = (([ordered]@{
+                job_id = $jobId; status = 'unknown'; done = $true
+                message = 'sd-server does not know this job (it was likely restarted). Local tracking for it has been dropped.'
+            }) | ConvertTo-Json -Depth 5) }) }
+        }
+        throw
+    }
+    $status = [string]$job.status
+
+    if ($status -in @('queued', 'generating')) {
+        $meta    = Read-JobMeta $jobId
+        $payload = [ordered]@{ job_id = $jobId; status = $status; done = $false }
+        if ($null -ne $job.queue_position) { $payload.queue_position = $job.queue_position }
+        if ($meta -and $meta.started_at) {
+            try { $payload.elapsed_sec = [int]([datetimeoffset]::Now - (ConvertTo-StartedDto $meta.started_at)).TotalSeconds } catch {}
+        }
+        $payload.message = 'Not finished yet — call check_image_job again with this job_id.'
+        Write-Log INFO ("check_image_job: {0} status={1}" -f $jobId, $status)
+        return @{ content = @(@{ type = 'text'; text = ($payload | ConvertTo-Json -Depth 5) }) }
+    }
+
+    if ($status -eq 'completed') {
+        $meta   = Read-JobMeta $jobId
+        $result = Complete-ImageJob -Job $job -Meta $meta
+        Remove-JobMeta $jobId
+        Write-Log INFO ("check_image_job: {0} completed, delivered" -f $jobId)
+        return $result
+    }
+
+    # failed / cancelled / anything else terminal
+    Remove-JobMeta $jobId
+    $errMsg = if ($job.error) { "$($job.error.code): $($job.error.message)" } else { 'unknown error' }
+    Write-Log WARN ("check_image_job: {0} {1} — {2}" -f $jobId, $status, $errMsg)
+    return @{
+        content = @(@{ type = 'text'; text = (([ordered]@{ job_id = $jobId; status = $status; done = $true; error = $errMsg }) | ConvertTo-Json -Depth 5) })
+        isError = $true
+    }
+}
+
+# List the jobs this server stashed locally (one meta file each). These are
+# the in-flight fire-and-forget jobs; completed/failed ones are removed once
+# check_image_job fetches them.
+function Get-PendingJobList {
+    $jobs = @()
+    if (Test-Path -LiteralPath $script:JobsDir) {
+        foreach ($f in (Get-ChildItem -LiteralPath $script:JobsDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $jobId = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            # Reuse Read-JobMeta so the meta-read (and its id validation) lives
+            # in one place rather than a duplicated inline ConvertFrom-Json.
+            $m     = Read-JobMeta $jobId
+            $entry = [ordered]@{ job_id = $jobId }
+            if ($m) {
+                if ($m.started_at) { $entry.started_at = $m.started_at }
+                if ($m.save_path)  { $entry.save_path  = $m.save_path }
+                if ($m.snapshot -and $m.snapshot.prompt) {
+                    $p = [string]$m.snapshot.prompt
+                    $entry.prompt = $p.Substring(0, [Math]::Min(80, $p.Length))
+                }
+            }
+            $jobs += $entry
+        }
+    }
+    $payload = [ordered]@{
+        pending_jobs = $jobs
+        count        = $jobs.Count
+        note         = 'Jobs this MCP server is tracking locally. Pass a job_id to check_image_job for its status/result; completed or failed jobs are dropped once fetched.'
+    }
+    return @{ content = @(@{ type = 'text'; text = ($payload | ConvertTo-Json -Depth 6) }) }
+}
+
+# ── Tool: cancel_image_job ───────────────────────────────────────────
+# Ask sd-server to cancel a queued/running job and drop our local meta. A
+# job that already finished (or never existed) is reported, not an error.
+function Invoke-CancelImageJob {
+    param([hashtable]$Arguments)
+    if (-not $Arguments -or
+        -not $Arguments.ContainsKey('job_id') -or
+        [string]::IsNullOrWhiteSpace([string]$Arguments['job_id'])) {
+        throw "missing required argument: job_id"
+    }
+    $jobId = [string]$Arguments['job_id']
+    $msg = ''
+    try {
+        Invoke-SdJson -Method POST -Path "/sdcpp/v1/jobs/$jobId/cancel" -TimeoutSec 10 | Out-Null
+        $msg = "Requested cancellation of job '$jobId'."
+    } catch {
+        $msg = "Could not cancel job '$jobId' (it may already be finished or unknown): $($_.Exception.Message)"
+    }
+    Remove-JobMeta $jobId
+    Write-Log INFO "cancel_image_job: $msg"
+    return @{ content = @(@{ type = 'text'; text = $msg }) }
 }
 
 # ── Tool: encode_file_base64 ─────────────────────────────────────────
@@ -895,7 +1236,7 @@ function Invoke-SwitchPreset {
 $Tools = @(
     @{
         name        = 'generate_image'
-        description = 'Generate an image with stable-diffusion.cpp via the local sd-server. Returns the rendered image inline as base64 (no on-disk copy). Requires sd-server to be running. Exactly one of `prompt` (plain text) or `prompt_json` (structured caption object) is required — check get_model_info.prompt_format to pick: models trained on JSON captions (Ideogram4) need prompt_json and reject plain text.'
+        description = 'Start an image generation on the local sd-server. ASYNC by default (fire-and-forget): submits the job and returns a job_id immediately — then poll check_image_job with that job_id for progress and to receive the finished image (renders can take 10s-many minutes). Pass wait=true to instead block until the image is ready and return it inline (streams notifications/progress while it works). Requires sd-server to be running. Exactly one of `prompt` (plain text) or `prompt_json` (structured caption object) is required — check get_model_info.prompt_format to pick: models trained on JSON captions (Ideogram4) need prompt_json and reject plain text.'
         inputSchema = @{
             type     = 'object'
             properties = @{
@@ -909,6 +1250,8 @@ $Tools = @(
                 guidance        = @{ type = 'number';  description = 'Distilled guidance scale (Flux/Chroma-era models).' }
                 sampler         = @{ type = 'string';  description = 'Sampler: euler, euler_a, dpm++2m, etc. Defaults to the preset.' }
                 scheduler       = @{ type = 'string';  description = 'Noise scheduler: discrete, karras, ays, etc. Defaults to the preset.' }
+                flow_shift      = @{ type = 'number';  description = 'Flow-model sigma shift (SD3/Wan/Ideogram4 etc.). Defaults to the server (auto). NB: sd.cpp auto for Ideogram4 is 1.0 while reference ComfyUI workflows use 5.' }
+                lora_multiplier = @{ type = 'number';  description = 'Override the multiplier of the preset-injected LoRA(s) for this request only (applies to all entries; 0 disables them). Defaults to the value in the preset INI lora key (e.g. 0.6). No effect when the active preset has no lora key.' }
                 seed            = @{ type = 'integer'; description = 'Random seed. Omit or set -1 for random.' }
                 batch_count     = @{ type = 'integer'; default = 1; minimum = 1; maximum = 8 }
                 output_format   = @{ type = 'string';  enum = @('png','jpeg','webp'); default = 'jpeg'; description = 'JPEG keeps Claude context cost low; PNG for pixel-perfect.' }
@@ -922,7 +1265,8 @@ $Tools = @(
                 strength             = @{ type = 'number';  minimum = 0; maximum = 1; description = 'Denoise strength for img2img (0 = keep init_image, 1 = ignore it). Only used when init_image is set. sd.cpp default is 0.75.' }
                 auto_resize_ref_image = @{ type = 'boolean'; description = 'If true, ref_images are resized to match output width/height. Defaults to the sd-server preset.' }
                 save_path            = @{ type = 'string';  description = 'Optional absolute path to also write the rendered image to disk. Parent directory is auto-created. If batch_count > 1, the filename stem is suffixed with _001, _002, ... before the extension. Extension is honoured as-is — match it to output_format (jpeg/png/webp) yourself. Relative paths resolve against the MCP server CWD, which is unpredictable — pass absolute paths. A sidecar `<stem>.json` is written next to the image(s) containing the flat request params (prompt, dimensions, sampler/scheduler, steps, cfg_scale/guidance, seed, init_image/ref_images paths, per-image seeds reported by sd-server) so the call can be replayed later.' }
-                return_inline        = @{ type = 'boolean'; description = 'Whether to also embed the rendered image(s) as inline base64 MCP content. Default: true when save_path is not set (current behavior), false when save_path is set (avoids blowing up context for batches you only want on disk). Set true with save_path to get both.' }
+                return_inline        = @{ type = 'boolean'; description = 'Whether to also embed the rendered image(s) as inline base64 MCP content. Default: true when save_path is not set (current behavior), false when save_path is set (avoids blowing up context for batches you only want on disk). Set true with save_path to get both. In async mode this preference is stashed with the job and honoured by check_image_job when it delivers the result.' }
+                wait                 = @{ type = 'boolean'; default = $false; description = 'If false (default), this tool returns a job_id immediately (fire-and-forget) and you fetch the image later with check_image_job — best for long renders so the call does not block. If true, the tool blocks until the render finishes and returns the image inline, streaming notifications/progress when a progressToken is supplied.' }
             }
         }
     },
@@ -982,6 +1326,27 @@ $Tools = @(
             type       = 'object'
             properties = @{}
         }
+    },
+    @{
+        name        = 'check_image_job'
+        description = 'Check an async generate_image job by its job_id and, when finished, receive the rendered image. This is how you consult progress for a fire-and-forget generate_image call. While the job is queued/generating it returns {status, queue_position, elapsed_sec, done:false} — poll again. When done it returns the image(s) (inline base64 and/or written to the save_path you gave generate_image, plus the params sidecar) exactly as wait=true would have. A failed/cancelled job comes back as an error with sd-server''s reason. Call with NO job_id to list the jobs this server is currently tracking. Completed/failed jobs are forgotten once fetched, so fetch each job_id once you see done:true.'
+        inputSchema = @{
+            type       = 'object'
+            properties = @{
+                job_id = @{ type = 'string'; description = 'The job_id returned by generate_image (async mode). Omit to instead list all jobs this server is locally tracking.' }
+            }
+        }
+    },
+    @{
+        name        = 'cancel_image_job'
+        description = 'Cancel a queued or in-progress async generate_image job by its job_id (asks sd-server to abort it) and drop the local tracking record. A job that already finished or never existed is reported back, not treated as an error. Use check_image_job (no job_id) to discover outstanding job ids.'
+        inputSchema = @{
+            type     = 'object'
+            required = @('job_id')
+            properties = @{
+                job_id = @{ type = 'string'; description = 'The job_id returned by generate_image (async mode) to cancel.' }
+            }
+        }
     }
 )
 
@@ -998,6 +1363,8 @@ function Invoke-Tool {
     param([string]$Name, [hashtable]$Arguments, $ProgressToken = $null)
     switch ($Name) {
         'generate_image'     { return Invoke-GenerateImage    -Arguments $Arguments -ProgressToken $ProgressToken }
+        'check_image_job'    { return Invoke-CheckImageJob    -Arguments $Arguments }
+        'cancel_image_job'   { return Invoke-CancelImageJob   -Arguments $Arguments }
         'encode_file_base64' { return Invoke-EncodeFileBase64 -Arguments $Arguments }
         'get_model_info'     { return Invoke-GetModelInfo }
         'server_status'      { return Invoke-ServerStatus }

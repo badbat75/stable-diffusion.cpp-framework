@@ -228,11 +228,50 @@ Add-StringArg 'llm'              '--llm'
 Add-StringArg 't5xxl'            '--t5xxl'
 Add-StringArg 'clip_l'           '--clip_l'
 Add-StringArg 'clip_g'           '--clip_g'
-Add-StringArg 'lora-model-dir'   '--lora-model-dir'
+# auto | immediately | at_runtime. auto picks at_runtime on quantized
+# weights (correct but adds per-step LoRA matmuls — ~9x slower per step on
+# ideogram4 Q4_0); immediately merges into the weights once at request
+# time (fast steps, possible precision loss on quantized params).
+Add-StringArg 'lora-apply-mode'  '--lora-apply-mode'
 Add-StringArg 'embd-dir'         '--embd-dir'
+
+# Per-preset LoRAs: the `lora` INI key holds FULL file paths (like vae/llm/
+# t5xxl), parsed by ConvertTo-LoraEntries. sd-server has no per-file LoRA
+# flag — only --lora-model-dir plus per-request relative paths — so the
+# directory is always derived from the first entry's parent (all entries
+# must share it; there is deliberately no separate lora-model-dir INI key).
+# The actual per-request injection is done by mcp-server.ps1 (the built-in
+# web UI has its own LoRA selector).
+$loraEntries = @()
+if ($keys.ContainsKey('lora') -and $keys['lora']) {
+    $loraEntries = @(ConvertTo-LoraEntries -Value $keys['lora'])
+}
+if ($loraEntries.Count -gt 0) {
+    $loraDir = Split-Path -Parent $loraEntries[0].Path
+    if ($loraDir) { $script:serverArgs += '--lora-model-dir', $loraDir }
+    # sd-server's --lora-model-dir is a SINGLE directory and mcp-server.ps1
+    # injects bare filenames relative to it, so a second LoRA from another
+    # folder would silently fail to resolve at render time. Warn loudly (don't
+    # block — the first entry still works) when any entry's parent differs.
+    foreach ($e in $loraEntries) {
+        $dir = Split-Path -Parent $e.Path
+        if ($dir -and ($dir -ine $loraDir)) {
+            Write-Warning ("LoRA '{0}' lives in '{1}', not '{2}'; sd-server resolves all preset LoRAs against the first entry's directory, so only files in '{2}' will load." -f $e.Path, $dir, $loraDir)
+        }
+    }
+} elseif ($keys.ContainsKey('lora-model-dir') -and $keys['lora-model-dir']) {
+    # Pre-rename key: the `lora` key replaced `lora-model-dir`, but old presets
+    # still carry the directory. Keep it working when there are no `lora` paths
+    # to derive the dir from (sd-config round-trips this key untouched).
+    $script:serverArgs += '--lora-model-dir', $keys['lora-model-dir']
+}
 Add-StringArg 'type'             '--type'
 Add-StringArg 'max-vram'         '--max-vram'
 Add-StringArg 'sampler'          '--sampling-method'
+# Flow-model sigma shift (SD3/Wan/Ideogram4 etc.; sd-server default: auto).
+# NB: sd.cpp's auto for ideogram4 is 1.0 while the reference ComfyUI
+# workflows run ModelSamplingAuraFlow shift=5.
+Add-StringArg 'flow-shift'       '--flow-shift'
 Add-StringArg 'steps'            '--steps'
 Add-StringArg 'cfg-scale'        '--cfg-scale'
 Add-StringArg 'guidance'         '--guidance'

@@ -64,6 +64,42 @@ function Get-Presets {
     return $result
 }
 
+# Parse a preset's `lora` INI value. The key mirrors the other model-path
+# keys (vae / t5xxl / llm): each entry is a FULL path to the LoRA file,
+# optionally suffixed with :<multiplier> (default 1.0); comma-separate
+# multiple entries. The trailing segment is only treated as a multiplier
+# when it parses as a number, so the drive colon in `E:\...` never splits
+# the path. Consumers: run-server.ps1 derives --lora-model-dir from the
+# first entry's parent directory (sd-server has no per-file LoRA flag, only
+# a directory + per-request relative paths), and mcp-server.ps1 injects the
+# bare filenames into each img_gen request — which is why all entries of a
+# preset must live in the same directory.
+function ConvertTo-LoraEntries {
+    param([string]$Value)
+    $entries = @()
+    foreach ($spec in ($Value -split ',')) {
+        $spec = $spec.Trim()
+        if (-not $spec) { continue }
+        $path = $spec
+        $mult = 1.0
+        $idx = $spec.LastIndexOf(':')
+        if ($idx -gt 0) {
+            $parsed = 0.0
+            if ([double]::TryParse($spec.Substring($idx + 1).Trim(),
+                    [Globalization.NumberStyles]::Float,
+                    [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                $path = $spec.Substring(0, $idx).Trim()
+                $mult = $parsed
+            }
+        }
+        if ($path) { $entries += [pscustomobject]@{ Path = $path; Multiplier = $mult } }
+    }
+    # No `,$entries` here: callers collect with @(...), and the comma-wrapper
+    # would survive it as a NESTED array (the pipeline unwraps only one
+    # level), which then serializes as [[{...}]] in JSON.
+    return $entries
+}
+
 # Read %LOCALAPPDATA%\stable-diffusion.cpp\run\sd-server.state. Returns the
 # parsed JSON (PSCustomObject with pid/host/port/preset/server_exe/started_at)
 # or $null if the file is missing or unparseable. Caller is responsible for
