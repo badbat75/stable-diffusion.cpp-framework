@@ -878,7 +878,8 @@ fn refresh_file_options(app: &AppWindow, scan: &model_scan::LoraScan) {
 
     // Uncond diffusion model (Ideogram4) is the same kind of file as the
     // conditional one and resolves to the identical directory list, so scan
-    // Category::Model once and clone the result into both dropdowns.
+    // Category::Model once and clone the result into both dropdowns. The combo
+    // itself is driven as Category::UncondModel below (optional → `(none)`).
     let model_scan_result = model_scan::list(&models_dir, model_scan::Category::Model);
     let uncond_scan_result = model_scan_result.clone();
     let vae_scan_result = model_scan::list(&models_dir, model_scan::Category::Vae);
@@ -900,7 +901,7 @@ fn refresh_file_options(app: &AppWindow, scan: &model_scan::LoraScan) {
     );
     apply_scanned(
         app,
-        model_scan::Category::Model,
+        model_scan::Category::UncondModel,
         uncond_scan_result,
         form.uncond_diffusion_model.as_str(),
         |app, lbl, val, idx| {

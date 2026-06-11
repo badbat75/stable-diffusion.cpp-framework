@@ -50,6 +50,12 @@ pub struct FileOption {
 #[derive(Copy, Clone, Debug)]
 pub enum Category {
     Model,
+    /// Ideogram4's standalone unconditional transformer
+    /// (--uncond-diffusion-model). Same on-disk catalogue as `Model` (so it
+    /// scans the identical directories), but OPTIONAL — only Ideogram4 sets it,
+    /// every other preset leaves it empty and must be able to clear it via the
+    /// `(none)` sentinel.
+    UncondModel,
     Vae,
     Llm,
     T5xxl,
@@ -59,9 +65,9 @@ pub enum Category {
 }
 
 impl Category {
-    /// VAE / LLM / T5-XXL / CLIP-L / CLIP-G / LoRA are all optional sub-models —
-    /// the user must be able to clear them ((none) sentinel). The main
-    /// diffusion model is required.
+    /// VAE / LLM / T5-XXL / CLIP-L / CLIP-G / LoRA and the uncond diffusion
+    /// model are all optional sub-models — the user must be able to clear them
+    /// ((none) sentinel). Only the main diffusion model is required.
     pub fn is_optional(self) -> bool {
         !matches!(self, Category::Model)
     }
@@ -81,8 +87,9 @@ impl Category {
     fn scan_relatives(self) -> &'static [&'static str] {
         match self {
             // ModelsDir IS the main-models bucket; the others are fallbacks
-            // for users whose ModelsDir points one level higher (root).
-            Category::Model => &["", "models", "diffusion_models"],
+            // for users whose ModelsDir points one level higher (root). The
+            // uncond transformer is the same kind of file in the same bucket.
+            Category::Model | Category::UncondModel => &["", "models", "diffusion_models"],
 
             Category::Vae => &["../vaes", "../vae", "vaes", "vae"],
 
