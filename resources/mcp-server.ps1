@@ -13,7 +13,12 @@
 #
 # Tools exposed:
 #   generate_image     — txt2img / img2img via /sdcpp/v1/img_gen; async
-#                        (fire-and-forget) by default, wait=true to block
+#                        (fire-and-forget) by default, wait=true to block.
+#                        A save_path job also spawns a detached background
+#                        collector (this script, -CollectJob <id>) that saves
+#                        the result to disk on completion, so it survives even
+#                        if the client never polls — sd-server drops a completed
+#                        result after 600s (completed_ttl_seconds).
 #   check_image_job    — poll an async job by id; deliver the image when done
 #   cancel_image_job   — cancel a queued/running async job by id
 #   encode_file_base64 — read a local file, return base64 (debug aid)
@@ -44,7 +49,15 @@ param(
     [string]$ServerIni        = (Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\config\server.ini"),
     [string]$LogPath          = (Join-Path $env:LOCALAPPDATA "stable-diffusion.cpp\logs\mcp-server.log"),
     [int]   $PollIntervalMs   = 500,
-    [int]   $RequestTimeoutSec = 600
+    [int]   $RequestTimeoutSec = 600,
+    # Background-collector mode. When -CollectJob is set this process does NOT
+    # run the MCP stdio loop: it polls that one async job to completion and
+    # persists the result to disk via Complete-ImageJob, immune to sd-server's
+    # 600s completed-result TTL, then exits. Spawned detached by the
+    # fire-and-forget generate_image path for save_path jobs (Start-CollectorProcess).
+    [string]$CollectJob       = '',
+    [int]   $CollectPollSec   = 15,
+    [int]   $CollectMaxSec    = 21600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -430,12 +443,23 @@ function Invoke-GenerateImage {
     # immediately. The caller polls check_image_job for progress + the image.
     if (-not $wait) {
         Save-JobMeta -JobId $jobId -Meta $meta
+        # For save_path jobs, spawn a detached collector so the image lands on
+        # disk even if the client never polls in time: sd-server discards a
+        # completed result after 600s (completed_ttl_seconds) and the bridge
+        # only writes to disk when it collects. Inline-only jobs (no save_path)
+        # have no disk target, so they still rely on the client polling.
+        $autoSave = -not [string]::IsNullOrWhiteSpace($savePath)
+        if ($autoSave) { Start-CollectorProcess -JobId $jobId }
+        $msg = 'Image generation started (fire-and-forget). Poll check_image_job with this job_id for progress and the finished image; cancel with cancel_image_job.'
+        if ($autoSave) {
+            $msg += ' A background collector will save the finished image to the requested save_path automatically, so it is not lost even if you do not poll in time.'
+        }
         $payload = [ordered]@{
             job_id  = $jobId
             status  = 'submitted'
-            message = 'Image generation started (fire-and-forget). Poll check_image_job with this job_id for progress and the finished image; cancel with cancel_image_job.'
+            message = $msg
         }
-        Write-Log INFO "generate_image async: returned job_id $jobId"
+        Write-Log INFO ("generate_image async: returned job_id {0} (collector={1})" -f $jobId, $autoSave)
         return @{ content = @(@{ type = 'text'; text = ($payload | ConvertTo-Json -Depth 5) }) }
     }
 
@@ -716,6 +740,40 @@ function Remove-JobMeta {
     param([string]$JobId)
     $path = Get-JobMetaPath $JobId
     if ($path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+}
+
+# Spawn a detached background collector for a fire-and-forget job. The child
+# re-enters THIS script with -CollectJob <id>, reusing every helper defined
+# here, and polls the job to completion then saves it to disk through
+# Complete-ImageJob — so delivery no longer depends on the client polling
+# check_image_job within sd-server's 600s completed-result TTL. Only meaningful
+# when the job has a save_path: the collector's only delivery channel is disk
+# (it has no MCP client to return inline to). Best-effort — a spawn failure
+# just degrades to the old poll-it-yourself behaviour.
+function Start-CollectorProcess {
+    param([string]$JobId)
+    $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if (-not $pwshCmd) {
+        Write-Log WARN "pwsh.exe not on PATH; cannot spawn collector for $JobId"
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        Write-Log WARN "cannot resolve own script path; no collector for $JobId"
+        return
+    }
+    # Single-string -ArgumentList with every path quoted: Start-Process does not
+    # quote array elements, so a "Program Files" path would split (mirrors
+    # Start-SdServer). JobId matches ^[A-Za-z0-9_.-]+$ so it needs no escaping,
+    # but quote it for symmetry. Pass -ServerIni / -LogPath through so the
+    # collector resolves the same endpoint and logs to the same file.
+    $argString = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -CollectJob "{1}" -ServerIni "{2}" -LogPath "{3}"' -f `
+        $PSCommandPath, $JobId, $ServerIni, $LogPath
+    try {
+        Start-Process -FilePath $pwshCmd.Source -ArgumentList $argString -WindowStyle Hidden | Out-Null
+        Write-Log INFO "spawned background collector for job $JobId"
+    } catch {
+        Write-Log WARN ("failed to spawn collector for {0}: {1}" -f $JobId, $_.Exception.Message)
+    }
 }
 
 # ── Tool: check_image_job ────────────────────────────────────────────
@@ -1268,9 +1326,9 @@ $Tools = @(
                 }
                 strength             = @{ type = 'number';  minimum = 0; maximum = 1; description = 'Denoise strength for img2img (0 = keep init_image, 1 = ignore it). Only used when init_image is set. sd.cpp default is 0.75.' }
                 auto_resize_ref_image = @{ type = 'boolean'; description = 'If true, ref_images are resized to match output width/height. Defaults to the sd-server preset.' }
-                save_path            = @{ type = 'string';  description = 'Optional absolute path to also write the rendered image to disk. Parent directory is auto-created. If batch_count > 1, the filename stem is suffixed with _001, _002, ... before the extension. Extension is honoured as-is — match it to output_format (jpeg/png/webp) yourself. Relative paths resolve against the MCP server CWD, which is unpredictable — pass absolute paths. A sidecar `<stem>.json` is written next to the image(s) containing the flat request params (prompt, dimensions, sampler/scheduler, steps, cfg_scale/guidance, seed, init_image/ref_images paths, per-image seeds reported by sd-server) so the call can be replayed later.' }
+                save_path            = @{ type = 'string';  description = 'Optional absolute path to also write the rendered image to disk. Parent directory is auto-created. If batch_count > 1, the filename stem is suffixed with _001, _002, ... before the extension. Extension is honoured as-is — match it to output_format (jpeg/png/webp) yourself. Relative paths resolve against the MCP server CWD, which is unpredictable — pass absolute paths. A sidecar `<stem>.json` is written next to the image(s) containing the flat request params (prompt, dimensions, sampler/scheduler, steps, cfg_scale/guidance, seed, init_image/ref_images paths, per-image seeds reported by sd-server) so the call can be replayed later. In fire-and-forget mode (wait omitted/false), setting save_path also starts a detached background collector that saves the finished image to this path automatically — so a long render is not lost even if you never poll check_image_job (sd-server otherwise discards a completed result after 600s).' }
                 return_inline        = @{ type = 'boolean'; description = 'Whether to also embed the rendered image(s) as inline base64 MCP content. Default: true when save_path is not set (current behavior), false when save_path is set (avoids blowing up context for batches you only want on disk). Set true with save_path to get both. In async mode this preference is stashed with the job and honoured by check_image_job when it delivers the result.' }
-                wait                 = @{ type = 'boolean'; default = $false; description = 'If false (default), this tool returns a job_id immediately (fire-and-forget) and you fetch the image later with check_image_job — best for long renders so the call does not block. If true, the tool blocks until the render finishes and returns the image inline, streaming notifications/progress when a progressToken is supplied.' }
+                wait                 = @{ type = 'boolean'; default = $false; description = 'If false (default), this tool returns a job_id immediately (fire-and-forget) and you fetch the image later with check_image_job — best for long renders so the call does not block. When save_path is set, a detached collector also saves the result to disk automatically, so the image survives even if you poll late or not at all. If true, the tool blocks until the render finishes and returns the image inline (no collector needed), streaming notifications/progress when a progressToken is supplied.' }
             }
         }
     },
@@ -1435,6 +1493,88 @@ function Invoke-RpcRequest {
             return New-RpcError $id -32601 "method not found: $method"
         }
     }
+}
+
+# ── Background collector mode ─────────────────────────────────────────
+# Entered when this script is invoked with -CollectJob <id> (spawned detached
+# by Start-CollectorProcess). NOT the MCP stdio server: it polls that one job to
+# a terminal state and, on completion, persists the result to disk through
+# Complete-ImageJob — independent of any MCP client, so a save_path render is
+# never lost to sd-server's 600s completed-result TTL even if the client polls
+# late or not at all. Then it exits. All HTTP / meta / delivery logic is reused
+# from the functions above; the only thing it cannot do is return inline (no
+# client), which is why it is spawned only for save_path jobs.
+#
+# Contention with a manual check_image_job for the same id is benign: whoever
+# reads the meta first saves the file (Complete-ImageJob is idempotent on the
+# same path) and removes the meta; the other finds the meta gone and exits /
+# degrades to inline-only. The image is never lost in any ordering.
+if (-not [string]::IsNullOrWhiteSpace($CollectJob)) {
+    Write-Log INFO ("collector started for job {0} (poll={1}s, max={2}s, PID {3})" -f $CollectJob, $CollectPollSec, $CollectMaxSec, $PID)
+    $deadline = (Get-Date).AddSeconds($CollectMaxSec)
+    $fails    = 0
+    $maxFails = 10            # consecutive lost-contact polls before giving up (~2.5 min @15s)
+    while ($true) {
+        Start-Sleep -Seconds $CollectPollSec
+        if ((Get-Date) -gt $deadline) {
+            Write-Log WARN ("collector for {0} hit {1}s backstop; leaving meta for manual recovery" -f $CollectJob, $CollectMaxSec)
+            break
+        }
+        try {
+            $job   = Invoke-SdJson -Method GET -Path "/sdcpp/v1/jobs/$CollectJob" -TimeoutSec 10
+            $fails = 0
+        } catch {
+            # 404 (forgotten) / 410 (expired+purged): nothing left to collect.
+            # Any OTHER failure (connection refused, timeout) is transient — the
+            # job may still be rendering — so tolerate a few before giving up.
+            $httpStatus = $null
+            if ($_.Exception -is [Microsoft.PowerShell.Commands.HttpResponseException]) {
+                $httpStatus = [int]$_.Exception.Response.StatusCode
+            } elseif ($_.Exception.Data -and $_.Exception.Data.Contains('StatusCode')) {
+                $httpStatus = [int]$_.Exception.Data['StatusCode']
+            }
+            if ($httpStatus -eq 404 -or $httpStatus -eq 410) {
+                Write-Log WARN ("collector: job {0} gone from sd-server (HTTP {1}) — stopping" -f $CollectJob, $httpStatus)
+                Remove-JobMeta $CollectJob
+                break
+            }
+            $fails++
+            Write-Log WARN ("collector poll {0}/{1} failed for {2}: {3}" -f $fails, $maxFails, $CollectJob, $_.Exception.Message)
+            if ($fails -ge $maxFails) {
+                Write-Log WARN ("collector for {0} lost contact ({1} consecutive failures); leaving meta for manual recovery" -f $CollectJob, $maxFails)
+                break
+            }
+            continue
+        }
+
+        $status = [string]$job.status
+        if ($status -in @('queued', 'generating')) { continue }
+
+        if ($status -eq 'completed') {
+            $meta = Read-JobMeta $CollectJob
+            if ($null -eq $meta) {
+                # The client's own check_image_job already collected + removed it.
+                Write-Log INFO ("collector: job {0} already collected by client — nothing to do" -f $CollectJob)
+                break
+            }
+            try {
+                $null = Complete-ImageJob -Job $job -Meta $meta
+                Write-Log INFO ("collector: job {0} completed and saved to disk" -f $CollectJob)
+            } catch {
+                Write-Log ERROR ("collector: failed to deliver job {0}: {1}" -f $CollectJob, $_.Exception.Message)
+            }
+            Remove-JobMeta $CollectJob
+            break
+        }
+
+        # failed / cancelled / any other terminal status
+        $errMsg = if ($job.error) { "$($job.error.code): $($job.error.message)" } else { 'unknown error' }
+        Write-Log WARN ("collector: job {0} {1} — {2}" -f $CollectJob, $status, $errMsg)
+        Remove-JobMeta $CollectJob
+        break
+    }
+    Write-Log INFO ("collector for {0} exiting" -f $CollectJob)
+    exit 0
 }
 
 # ── Main loop ────────────────────────────────────────────────────────
